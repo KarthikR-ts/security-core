@@ -29,6 +29,12 @@ id_ed25519*
 kubeconfig*
 known_hosts
 
+# Internal documentation - kept local, not published.
+# NOTE: these files remain in git history from earlier commits. Excluding them
+# now prevents future pushes from carrying them; it does not erase them.
+# Re-add with:  git rm --cached -r docs && git add -f docs
+docs/
+
 
 # IDE
 .vscode/

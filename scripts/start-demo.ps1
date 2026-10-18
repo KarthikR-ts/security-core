@@ -41,8 +41,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$Host        = '148.100.99.33',
-    [string]$User        = 'linux1',
+    # No host is hardcoded. Set AEGIS_HOST (and optionally AEGIS_USER) in your
+    # environment, or pass -Host. Keeping the real address out of the
+    # repository means this file is safe to publish.
+    [string]$Host        = $env:AEGIS_HOST,
+    [string]$User        = $(if ($env:AEGIS_USER) { $env:AEGIS_USER } else { 'linux1' }),
     [string]$Key         = "$env:USERPROFILE\.ssh\ibm_z",
     [int]   $Port        = 8080,
     [ValidateSet('procfs', 'replay')]
@@ -53,6 +56,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ── Preflight: fail fast and legibly ────────────────────────────────
+
+if (-not $Host) {
+    Write-Host "No host specified." -ForegroundColor Red
+    Write-Host "Set the environment variable once:" -ForegroundColor DarkGray
+    Write-Host "  `$env:AEGIS_HOST = '<your-linuxone-host>'" -ForegroundColor Gray
+    Write-Host "or pass it per-run:" -ForegroundColor DarkGray
+    Write-Host "  .\start-demo.ps1 -Host '<your-linuxone-host>'" -ForegroundColor Gray
+    exit 1
+}
 
 if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
     Write-Host "ssh not found. Install the OpenSSH client:" -ForegroundColor Red
