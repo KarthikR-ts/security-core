@@ -49,6 +49,7 @@ Thumbs.db
 
 # Local tooling artifacts
 .openchamber/
+.tunnel.pid
 
 # Node (for teammates)
 node_modules/
