@@ -193,6 +193,15 @@ export default function LiveProcesses() {
                 · {data.counts.total_rss_mb} MB resident
               </span>
             ) : null}
+            {data?.counts?.rows_redacted > 0 && (
+              <span
+                className="text-[11px] font-mono text-emerald-400/90"
+                title="Arguments matched a redaction pattern and were masked before this response was sent"
+              >
+                · {data.counts.rows_redacted} row
+                {data.counts.rows_redacted === 1 ? '' : 's'} shielded
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
@@ -256,6 +265,16 @@ export default function LiveProcesses() {
                           {r.args.slice(1).join(' ').slice(0, 120)}
                         </span>
                       )}
+                      {/* Same marker as the event stream: this row's args were
+                          masked before leaving the host. */}
+                      {r.args_redacted && (
+                        <span
+                          className="ml-1.5 inline-flex items-center align-middle text-[9px] font-mono px-1 py-px rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                          title="Arguments were redacted before being sent to this view — same policy as the event stream"
+                        >
+                          shielded
+                        </span>
+                      )}
                     </td>
                     <td className="px-2 py-1.5 text-muted-foreground">{r.state}</td>
                     <td className="px-2 py-1.5 text-right text-muted-foreground">{r.threads}</td>
@@ -273,7 +292,7 @@ export default function LiveProcesses() {
       <p className="text-[10px] text-muted-foreground font-mono flex items-center gap-1.5">
         <Clock size={11} />
         Polling every {REFRESH_MS / 1000}s · kernel threads and the sensor's own lineage excluded ·
-        denylist enforced on comm
+        denylist enforced on comm · arguments redacted with the same policy as the event stream
       </p>
     </div>
   )

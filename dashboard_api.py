@@ -20,6 +20,7 @@ import time
 import asyncio
 import platform
 import shutil
+import re
 import logging
 import datetime
 import subprocess
@@ -933,12 +934,15 @@ async def api_procs(limit: int = Query(400, ge=1, le=2000)):
 
     This is a direct read, independent of the event stream: it answers "what
     is running right now", which is a different question from "what changed".
-    The same denylist and self-exclusion rules as the sensor apply, so what is
-    shown here is exactly what the sensor is allowed to observe.
 
-    Args are returned as observed. They are NOT redacted here because this
-    endpoint never persists them and never leaves the host; callers that export
-    the response inherit the redaction applied to event payloads.
+    Args ARE redacted here. An earlier version returned them raw on the
+    argument that the endpoint "never leaves the host" — which stopped being
+    true the moment this API was served through an SSH tunnel to a browser.
+    That produced the worst possible outcome for this project: the event
+    stream showing --api-key=[REDACTED_SECRET] while the live process table
+    showed the same argument in plaintext, on the same screen. The same
+    redaction policy is applied here, and which fields were touched is
+    reported per row.
     """
     if platform.system() != "Linux":
         return {"status": "unsupported", "reason": "/proc is Linux-only", "processes": []}
@@ -946,12 +950,49 @@ async def api_procs(limit: int = Query(400, ge=1, le=2000)):
     try:
         from forwarder.config import Config
         from forwarder.procfs_sensor import ProcfsSensor
+        from forwarder.redaction import redact_string
 
-        sensor = ProcfsSensor(Config())
+        cfg = Config()
+        sensor = ProcfsSensor(cfg)
         rows = sensor.snapshot()
+        redact_enabled = cfg.PRIVACY_REDACTION_ENABLED
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("proc snapshot failed: %s", exc)
         return {"status": "error", "reason": f"{type(exc).__name__}: {exc}", "processes": []}
+
+    redaction_applied = 0
+    # IPv4 masking must not damage the surrounding string. An earlier version
+    # split each argument on ':' and rejoined it, which turned 'http://host'
+    # into 'http:/host'. Match the address itself instead.
+    ip_re = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b")
+
+    def _mask_ips(text: str) -> tuple[str, bool]:
+        hit = False
+
+        def _sub(m):
+            nonlocal hit
+            octets = m.group(0).split(".")
+            if not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+                return m.group(0)
+            hit = True
+            return f"{octets[0]}.{octets[1]}.{octets[2]}.xxx"
+
+        return ip_re.sub(_sub, text), hit
+
+    for row in rows:
+        touched: set[str] = set()
+        if redact_enabled:
+            masked_args = []
+            for a in (row.get("args") or []):
+                value = redact_string(a, touched, "args")
+                value, ip_hit = _mask_ips(value)
+                if ip_hit:
+                    touched.add("args.ip")
+                masked_args.append(value)
+            row["args"] = masked_args
+        if touched:
+            redaction_applied += 1
+        row["args_redacted"] = bool(touched)
 
     truncated = rows[:limit]
     by_user: dict[str, int] = defaultdict(int)
@@ -973,6 +1014,8 @@ async def api_procs(limit: int = Query(400, ge=1, le=2000)):
             "returned": len(truncated),
             "by_uid": dict(by_user),
             "total_rss_mb": round(total_rss / 1024, 1),
+            "redaction_enabled": redact_enabled,
+            "rows_redacted": redaction_applied,
         },
         "processes": truncated,
     }
