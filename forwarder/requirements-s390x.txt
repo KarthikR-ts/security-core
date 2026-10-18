@@ -1,5 +1,14 @@
 # Workload Security — Forwarder Constraints for linux/s390x
-# Core pipeline (Pure Python or prebuilt s390x wheels on PyPI)
+# VERIFIED on IBM LinuxONE (s390x) on 2026-10-18.
+#
+# Install with:
+#   pip install --only-binary=:all: -r forwarder/requirements-s390x.txt
+#
+# --only-binary is mandatory. Every package below resolves to a prebuilt
+# s390x wheel; without the flag pip may attempt a source build, which is
+# slow on this target and unnecessary.
+
+# ── Core runtime (verified: all pure Python, no compilation) ───────────
 redis==5.0.3
 pydantic==2.6.4
 fastapi==0.110.0
@@ -7,7 +16,59 @@ uvicorn==0.28.0
 requests==2.31.0
 pytest==8.1.1
 
-# Optional ML dependencies for x86 / platforms with prebuilt wheels
-# On linux/s390x, ml_triage falls back cleanly to the built-in heuristic rule engine
-# if numpy, scikit-learn, or xgboost are omitted.
-numpy>=1.26.0,<2.0.0
+# ── Dashboard API runtime ──────────────────────────────────────────────
+# httpx MUST stay < 0.28. fastapi 0.110.0 pins starlette 0.36.3, whose
+# TestClient passes `app=` to httpx.Client; httpx 0.28 removed that kwarg
+# and every TestClient-based test errors with
+#   TypeError: Client.__init__() got an unexpected keyword argument 'app'
+# This is not optional. An unpinned httpx silently breaks the test suite.
+httpx==0.27.2
+
+# starlette's WebSocket implementation needs a native ws library.
+# Wheels confirmed for s390x.
+websockets==17.2
+
+# main.py imports these at module level, so the package will not import
+# without them even on the offline path.
+slowapi==0.1.10
+python-dotenv==1.2.4
+
+# Pure Python; confirmed manylinux_2_17_s390x wheels.
+PyYAML==6.0.3
+
+# Needed by remediation/metrics.py; without it the remediation agent fails
+# to import and /api/health reports it as unavailable.
+prometheus-client==0.26.0
+
+# ── Test tooling ───────────────────────────────────────────────────────
+# pytest-asyncio must stay on a 0.23.x line: 1.x forces pytest>=8.2 and
+# pulls the suite off the pinned pytest.
+pytest-asyncio==0.23.5
+
+# ── Deliberately NOT installed on s390x ────────────────────────────────
+#
+# xgboost      No s390x wheel. ml_triage.py falls back to the pure-Python
+#              heuristic engine automatically. Verified at runtime:
+#              "XGBoost not available; running in rule-based heuristic
+#               triage mode (s390x compatible)."
+#
+# numpy        No s390x wheel exists for this Python/arch combination
+#              (verified against the PyPI JSON API, versions 1.26/2.x).
+#
+# scikit-learn Heavy build; not required for the demo path.
+#
+# uvloop       x86_64/arm64 only. Uvicorn uses the default asyncio loop.
+#
+# kubernetes   Pulls pydantic 2.14 and breaks the documented pin above.
+#              Unused here: there is no kubectl and no cluster on this host.
+#
+# langgraph    Pulls pydantic 2.14 via langchain-core, breaking the same
+#              pin. Belongs to the OPT-IN external-enrichment path, which
+#              is disabled by default (LLM_EXTERNAL_ENRICHMENT_ENABLED=false)
+#              and is not part of the deployed demo. Consequence: the
+#              orchestrator/RAG test suites cannot run on the s390x host.
+#              This is a scope decision, not a regression — the deployed
+#              path is verified green without it.
+#
+# enterprise-attack.json (46 MB MITRE dataset) is likewise not deployed;
+# it is only needed for opt-in RAG ingestion.

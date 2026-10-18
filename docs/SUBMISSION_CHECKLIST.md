@@ -10,8 +10,12 @@
 - [x] Single source of truth: this repository (`main` branch, clean tree).
 - [x] No credentials committed: `.env` files are git-ignored; only `.env.example`
       and `.env.remediation.example` (placeholder values) are tracked.
+- [x] `.gitignore` now covers `*.pem`, `*.key`, `id_rsa*`, `kubeconfig*`,
+      `known_hosts` — key-file safety no longer depends on file location.
 - [ ] Paste the repository URL (see `git remote -v`) into the submission form.
-- [ ] Confirm judge access (repo invite or public toggle) **before** deadline.
+- [ ] **Make the repository public or send judge invites.** It is currently
+      private; judges cannot clone or reproduce the LinuxONE deployment without
+      access. This is the top remaining blocker.
 - [x] Working tree scanned for vendor/old project branding — none present
       (`grep -ri` over tracked files; MITRE ATT&CK dataset citations excluded as
       third-party public data).
@@ -19,13 +23,40 @@
 ## 2. Documentation
 
 - [x] `README.md` — setup, architecture, services.
+- [x] `DEPLOYMENT.md` — split into Part A (x86_64/Kind/live eBPF) and
+      Part B (LinuxONE `s390x`/native replay), so the two targets cannot be
+      confused.
 - [x] `docs/EVENT_CONTRACT.md` — canonical event schema (v1.0.0) incl. Person 3
       extension fields (triage basis/evidence, provenance).
 - [x] `docs/PRIVACY_POLICY.md` — field-by-field retention/redaction rationale.
+- [x] `docs/LINUXONE_PREFLIGHT.md` — **architecture evidence, per-service
+      `s390x` compatibility table, A/B/C option decision, all workarounds.**
+- [x] `docs/TEARDOWN.md` — surgical removal procedure, verified.
 - [x] `docs/DEMO_SCRIPT.md` — ≤ 3-minute video script with fallbacks.
 - [x] `docs/INTEGRATION_STATUS.md` — ports, merge status, blocked items.
 - [x] `docs/ORCHESTRATOR_README.md`, `docs/API_DOCUMENTATION.md` — service docs.
 - [ ] Record the demo video following `docs/DEMO_SCRIPT.md` (human action).
+
+## 2a. IBM Z / LinuxONE platform evidence
+
+- [x] Architecture confirmed `s390x` under z/VM 7.3.0 (Hypervisor vendor: IBM)
+      — genuine IBM Z, not x86 emulation.
+- [x] Python 3.12.3 with every dependency resolved to a **prebuilt `s390x`
+      wheel**; nothing compiled from source.
+- [x] Per-service compatibility table produced for images and dependencies.
+- [x] eBPF kernel gate run and recorded (passed — see below).
+- [x] Tetragon `s390x` support definitively ruled out with release-asset
+      evidence (amd64/arm64 only, no `s390x`).
+- [x] Deployment option **C (replay)** selected and justified in writing.
+- [x] Stack deployed natively; health reports `"status": "ok"` with
+      `source_arch: s390x` and `hardware: IBM LinuxONE (s390x)`.
+- [x] Smoke test passes on `s390x`.
+- [x] All listeners loopback-only; verified with `ss -ltn`.
+- [x] Teardown written and verified.
+
+**Live eBPF disclosure:** the kernel supports eBPF, but upstream Tetragon
+publishes no `s390x` build and the host has no container runtime. Events are
+fixtures and are labelled `fixture_replay` in the UI, the API, and the video.
 
 ## 3. Reproducibility (offline-first)
 
@@ -88,9 +119,10 @@ python scripts/smoke_test_replay.py                  # needs redis-server
 
 | Criterion | Evidence |
 |---|---|
-| IBM Z / LinuxONE relevance | Arch-aware ingestion: `source_arch` mirrors the event's host (`s390x` on LinuxONE, the real host arch elsewhere); health `platform.hardware` label follows it; dependency audit doc. |
-| Detection quality | Triage grades with basis + evidence; deterministic fixtures; tests. |
-| Explainability | MITRE mapping provenance (`offline_rules` vs `pinecone_rag`), evidence list, confidence semantics. |
-| Privacy | Write-time redaction + audit block + policy doc. |
-| Safe remediation | Human-in-loop + dry-run + negative tests (subprocess never called). |
-| Engineering rigour | Event contract, integration status, smoke tests, clean repo hygiene. |
+| IBM Z / LinuxONE relevance | Deployed and verified **natively on `s390x` under z/VM**: health reports `source_arch: s390x`, `hardware: IBM LinuxONE (s390x)`; per-service wheel/manifest compatibility table in `docs/LINUXONE_PREFLIGHT.md` §8. |
+| Detection quality | Triage grades with `basis` + evidence list; deterministic fixtures; heuristic engine verified running on `s390x` with XGBoost absent. |
+| Explainability | MITRE mapping provenance (`offline_rules` vs `pinecone_rag`), evidence list, explicit confidence semantics. |
+| Privacy | Write-time redaction in `forwarder/redaction.py`, audit block per event, `docs/PRIVACY_POLICY.md`. |
+| Safe remediation | `human-in-loop` + `dry_run=true` verified at runtime on `s390x`; negative tests assert `subprocess` is never reached. |
+| Engineering rigour | Event contract, compatibility table, documented workarounds, teardown, smoke tests, clean repo hygiene. |
+| Honesty | Replay labelled as replay everywhere; kernel gate result reported accurately rather than overstated as "eBPF broken on s390x". |

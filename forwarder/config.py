@@ -51,7 +51,7 @@ class Config:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ── API Server ────────────────────────────────────────────────
-    API_HOST: str = os.getenv("API_HOST", "0.0.0.0")
+    API_HOST: str = os.getenv("API_HOST", "127.0.0.1")
     API_PORT: int = int(os.getenv("API_PORT", "8081"))
 
     # ── ML Triage ─────────────────────────────────────────────────

@@ -16,6 +16,18 @@ build/
 # Environment
 .env
 .env.local
+.env.*.local
+
+# Private keys and credentials - never commit
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+kubeconfig*
+known_hosts
 
 
 # IDE

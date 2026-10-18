@@ -44,6 +44,7 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "security:events")
 FORWARDER_API_URL = os.getenv("FORWARDER_API_URL", "http://localhost:8081")
+DASHBOARD_API_HOST = os.getenv("DASHBOARD_API_HOST", "127.0.0.1")
 DASHBOARD_API_PORT = int(os.getenv("DASHBOARD_API_PORT", "8080"))
 POLICIES_DIR = os.getenv("POLICIES_DIR", os.path.join(os.path.dirname(__file__), "policies"))
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -1161,7 +1162,7 @@ async def get_audit_trail(event_id: str):
 if __name__ == "__main__":
     uvicorn.run(
         "dashboard_api:app",
-        host="0.0.0.0",
+        host=DASHBOARD_API_HOST,
         port=DASHBOARD_API_PORT,
         reload=False,
         log_level="info",
