@@ -8,12 +8,13 @@
  */
 
 import { useStore } from '../store'
-import { Shield, BookOpen, Crosshair, LayoutDashboard } from 'lucide-react'
+import { Shield, BookOpen, Crosshair, LayoutDashboard, Activity } from 'lucide-react'
 import { Separator } from '@/components/ui/separator'
 
 const NAV = [
-  { id: 'command', label: 'Command Center', icon: LayoutDashboard },
-  { id: 'ledger',  label: 'Incident Ledger', icon: BookOpen },
+  { id: 'command',  label: 'Command Center', icon: LayoutDashboard },
+  { id: 'ledger',   label: 'Incident Ledger', icon: BookOpen },
+  { id: 'processes', label: 'Live Processes', icon: Activity },
 ]
 
 export default function Sidebar() {

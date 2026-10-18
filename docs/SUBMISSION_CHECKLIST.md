@@ -44,19 +44,30 @@
 - [x] Python 3.12.3 with every dependency resolved to a **prebuilt `s390x`
       wheel**; nothing compiled from source.
 - [x] Per-service compatibility table produced for images and dependencies.
-- [x] eBPF kernel gate run and recorded (passed — see below).
+- [x] eBPF kernel gate run and recorded (**passed**).
 - [x] Tetragon `s390x` support definitively ruled out with release-asset
       evidence (amd64/arm64 only, no `s390x`).
-- [x] Deployment option **C (replay)** selected and justified in writing.
-- [x] Stack deployed natively; health reports `"status": "ok"` with
-      `source_arch: s390x` and `hardware: IBM LinuxONE (s390x)`.
-- [x] Smoke test passes on `s390x`.
+- [x] **Live process sensor implemented and verified** —
+      `forwarder/procfs_sensor.py`, `capture_mode: procfs_live`.
+- [x] Capability boundary stated everywhere it matters: API exposes
+      `sensor_kind` and `sensor_is_ebpf` separately; UI renders `/proc`
+      capture in a distinct colour with a visible "not eBPF" disclosure.
+- [x] Sensor privacy defaults enforced and tested: kernel threads skipped,
+      self-lineage excluded, `PROCFS_DENYLIST` matched on `comm`.
+- [x] Live events validated: 45/45 against the unified contract.
+- [x] Stack deployed natively; health reports `"status": "ok"`,
+      `source_arch: s390x`, `hardware: IBM LinuxONE (s390x)`.
+- [x] New endpoints verified on the host: `/api/procs`, `/api/system`.
+- [x] Smoke test passes on `s390x`; `forwarder/tests` 56 passed.
 - [x] All listeners loopback-only; verified with `ss -ltn`.
+- [x] **Single URL verified from Windows**: `.\scripts\start-demo.ps1` →
+      `http://localhost:8080` serves UI and API over one tunnel.
 - [x] Teardown written and verified.
 
-**Live eBPF disclosure:** the kernel supports eBPF, but upstream Tetragon
-publishes no `s390x` build and the host has no container runtime. Events are
-fixtures and are labelled `fixture_replay` in the UI, the API, and the video.
+**Live-capture disclosure:** capture is live but is **not eBPF**. The kernel
+supports eBPF (gate passed); Tetragon publishes no `s390x` build and the host
+has no container runtime, so live capture uses an unprivileged `/proc` poller.
+This is stated in the API, the UI, the preflight report, and the demo script.
 
 ## 3. Reproducibility (offline-first)
 

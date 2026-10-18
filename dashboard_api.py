@@ -18,6 +18,7 @@ import sys
 import json
 import time
 import asyncio
+import platform
 import logging
 import datetime
 import subprocess
@@ -773,6 +774,17 @@ async def api_health():
     latest_event = _event_cache[0] if _event_cache else {}
     source_arch = latest_event.get("source_arch", "unknown")
     capture_mode = latest_event.get("capture_mode", "unknown")
+
+    # "Live" is not one thing. Tetragon (eBPF) and the /proc poller are both
+    # live but have very different fidelity, so sensor_kind is reported
+    # separately and the UI renders them differently. Collapsing both into a
+    # boolean would overstate the weaker one.
+    sensor_kind = {
+        "live_tetragon": "ebpf_tetragon",
+        "procfs_live": "procfs_poll",
+    }.get(capture_mode, "fixture_replay")
+    is_live = capture_mode in ("live_tetragon", "procfs_live")
+
     platform_block = {
         "capture_mode": capture_mode,
         "event_source": latest_event.get("event_source", "unknown"),
@@ -785,7 +797,9 @@ async def api_health():
             if str(source_arch).lower() in ("s390x", "linuxone")
             else f"non-s390x ({source_arch})"
         ),
-        "live_capture": capture_mode == "live_tetragon",
+        "live_capture": is_live,
+        "sensor_kind": sensor_kind,
+        "sensor_is_ebpf": capture_mode == "live_tetragon",
         "latest_event_timestamp": latest_event.get("timestamp"),
     }
 
@@ -812,6 +826,111 @@ async def api_health():
         "platform": platform_block,
         "events_cached": len(_event_cache),
         "websocket_clients": len(_ws_clients),
+    }
+
+
+@app.get("/api/procs")
+async def api_procs(limit: int = Query(400, ge=1, le=2000)):
+    """
+    Live snapshot of the process table on THIS host, read directly from /proc.
+
+    This is a direct read, independent of the event stream: it answers "what
+    is running right now", which is a different question from "what changed".
+    The same denylist and self-exclusion rules as the sensor apply, so what is
+    shown here is exactly what the sensor is allowed to observe.
+
+    Args are returned as observed. They are NOT redacted here because this
+    endpoint never persists them and never leaves the host; callers that export
+    the response inherit the redaction applied to event payloads.
+    """
+    if platform.system() != "Linux":
+        return {"status": "unsupported", "reason": "/proc is Linux-only", "processes": []}
+
+    try:
+        from forwarder.config import Config
+        from forwarder.procfs_sensor import ProcfsSensor
+
+        sensor = ProcfsSensor(Config())
+        rows = sensor.snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("proc snapshot failed: %s", exc)
+        return {"status": "error", "reason": f"{type(exc).__name__}: {exc}", "processes": []}
+
+    truncated = rows[:limit]
+    by_user: dict[str, int] = defaultdict(int)
+    total_rss = 0
+    for r in rows:
+        by_user[str(r.get("uid", 0))] += 1
+        total_rss += int(r.get("rss_kb", 0) or 0)
+
+    return {
+        "status": "ok",
+        "platform": {
+            "machine": platform.machine(),
+            "system": platform.system(),
+            "node": platform.node(),
+            "is_s390x": platform.machine().lower() == "s390x",
+        },
+        "counts": {
+            "total": len(rows),
+            "returned": len(truncated),
+            "by_uid": dict(by_user),
+            "total_rss_mb": round(total_rss / 1024, 1),
+        },
+        "processes": truncated,
+    }
+
+
+@app.get("/api/system")
+async def api_system():
+    """Host-level platform evidence: load, uptime, memory, architecture."""
+    def _read(path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    load_raw = _read("/proc/loadavg")
+    load1 = load5 = load15 = 0.0
+    running = total = 0
+    if load_raw:
+        parts = load_raw.split()
+        try:
+            load1, load5, load15 = (float(parts[0]), float(parts[1]), float(parts[2]))
+        except (ValueError, IndexError):
+            pass
+        if "/" in parts[3] if len(parts) > 3 else False:
+            try:
+                running, total = (int(x) for x in parts[3].split("/"))
+            except ValueError:
+                pass
+
+    uptime_raw = _read("/proc/uptime").split()
+    uptime_seconds = float(uptime_raw[0]) if uptime_raw else 0.0
+
+    mem_total_kb = mem_avail_kb = 0
+    for line in _read("/proc/meminfo").splitlines():
+        if line.startswith("MemTotal:"):
+            mem_total_kb = int(line.split()[1])
+        elif line.startswith("MemAvailable:"):
+            mem_avail_kb = int(line.split()[1])
+
+    return {
+        "machine": platform.machine(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "python": platform.python_version(),
+        "hostname": platform.node(),
+        "cpu_count": os.cpu_count(),
+        "load_average": {"1m": load1, "5m": load5, "15m": load15},
+        "processes_running": running,
+        "processes_total": total,
+        "uptime_seconds": uptime_seconds,
+        "memory": {
+            "total_mb": round(mem_total_kb / 1024, 1),
+            "available_mb": round(mem_avail_kb / 1024, 1),
+        },
     }
 
 
@@ -1153,6 +1272,37 @@ async def get_audit_trail(event_id: str):
         return {"event_id": event_id, "audit_records": records}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ============================================================================
+# STATIC FRONTEND
+# ============================================================================
+# Mounted LAST on purpose. Starlette matches routes in registration order, so
+# a mount at "/" only catches requests that no API route claimed. Mounting it
+# earlier would shadow every /api/* endpoint.
+
+DIST_DIR = os.getenv("DASHBOARD_DIST", os.path.join(os.path.dirname(__file__), "dashboard", "dist"))
+
+if os.path.isdir(DIST_DIR):
+    from fastapi.staticfiles import StaticFiles
+
+    # html=True gives SPA fallback: unknown paths serve index.html so
+    # client-side routes survive a page reload.
+    app.mount("/", StaticFiles(directory=DIST_DIR, html=True), name="frontend")
+    logger.info("📦 Serving frontend bundle from %s", DIST_DIR)
+else:
+    @app.get("/")
+    async def root_no_bundle():
+        return {
+            "message": "Security-Core Dashboard API",
+            "note": (
+                "Frontend bundle not found. Build it with "
+                "'npm ci && npm run build' in dashboard/, or use the Vite "
+                "dev server on port 5173."
+            ),
+            "dist_expected_at": DIST_DIR,
+            "api": "/api/health",
+        }
 
 
 # ============================================================================

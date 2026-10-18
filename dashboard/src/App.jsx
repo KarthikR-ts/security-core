@@ -7,6 +7,7 @@ import Header from './components/Header'
 import CommandCenter from './components/CommandCenter'
 import IncidentLedger from './components/IncidentLedger'
 import ForensicsPanel from './components/ForensicsPanel'
+import LiveProcesses from './components/LiveProcesses'
 import SyscallTicker from './components/SyscallTicker'
 
 const WS_URL = `ws://${window.location.host}/api/ws/events`
@@ -99,6 +100,12 @@ function App() {
         return (
           <motion.div key="forensics" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="flex-1 overflow-hidden">
             <ForensicsPanel />
+          </motion.div>
+        )
+      case 'processes':
+        return (
+          <motion.div key="processes" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="flex-1 overflow-hidden">
+            <LiveProcesses />
           </motion.div>
         )
       default:

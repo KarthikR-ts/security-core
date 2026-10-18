@@ -432,26 +432,59 @@ quarantine, and IPv4 masking end to end.
 ## Step 6 — Run the stack
 
 ```bash
-bash scripts/aegis-ctl.sh start      # start | stop | restart | status
+bash scripts/aegis-ctl.sh start procfs     # LIVE /proc sensor
+bash scripts/aegis-ctl.sh start replay     # deterministic fixtures
+bash scripts/aegis-ctl.sh restart procfs   # restart in another mode
+bash scripts/aegis-ctl.sh stop
+bash scripts/aegis-ctl.sh status
 ```
 
-The forwarder has no API-only mode — it starts its API thread and then runs
-its ingestion stream to completion. `aegis-ctl.sh` feeds it a **named FIFO**
-that a writer re-opens on a loop, which keeps port 8081 alive and keeps
-events arriving while `capture_mode` stays honestly `fixture_replay`.
+**`procfs` (recommended for LinuxONE)** runs the live `/proc` sensor. It needs
+no privileges and produces real process telemetry from the s390x machine.
+`capture_mode` becomes `procfs_live` and health reports
+`sensor_kind: "procfs_poll"`, `sensor_is_ebpf: false`.
 
-## Step 7 — Access via tunnel
+**`replay`** reuses the FIFO approach below for a fully deterministic,
+offline demo.
 
-All services bind to `127.0.0.1`. Nothing listens on a public interface.
+Either way the forwarder has no API-only mode — it starts its API thread and
+then runs its ingestion stream. `aegis-ctl.sh` handles keeping it alive: a
+named FIFO that a writer re-opens on a loop for replay mode, and the sensor's
+own poll loop for procfs mode.
+
+### Build the frontend (workstation, not the host)
+
+The LinuxONE host has no `node`/`npm`. Build the bundle here and ship it:
+
+```powershell
+cd dashboard
+npm ci
+npm run build          # produces dashboard/dist/
+
+tar -cf dist.tar -C dashboard dist
+scp dist.tar linux1@<host>:~/
+ssh -i <key> linux1@<host> "cd ~/aegis && tar -xf ~/dist.tar -C dashboard/"
+```
+
+`dashboard_api.py` serves `dashboard/dist` at `/`, so UI and API share one
+origin and one port. The mount is registered **last** on purpose, so it never
+shadows an `/api/*` route.
+
+## Step 7 — Access: one command, one URL
+
+```powershell
+.\scripts\start-demo.ps1
+```
+
+Opens the tunnel, waits for the API, prints the platform/sensor block, and
+opens **http://localhost:8080**. Keep the window open; closing it closes the
+tunnel.
+
+Manual equivalent:
 
 ```bash
-# On your workstation — keep this terminal open
-ssh -i <key> linux1@<host> -L 8080:127.0.0.1:8080
+ssh -i <key> -N -L 8080:127.0.0.1:8080 linux1@<host>
 ```
-
-The React frontend has **no `node`/`npm` on the LinuxONE host**. Build it on
-your workstation (`cd dashboard && npm install && npm run build`) and serve
-the static bundle through the tunneled API.
 
 ## Step 8 — Confirm health
 

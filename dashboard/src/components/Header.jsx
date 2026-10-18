@@ -9,9 +9,10 @@ import { useStore } from '../store'
 import { useState, useEffect } from 'react'
 
 const PAGE_TITLES = {
-  command:   'Command Center',
-  ledger:    'Incident Ledger',
-  forensics: 'Forensics Deep-Dive',
+  command:    'Command Center',
+  ledger:     'Incident Ledger',
+  forensics:  'Forensics Deep-Dive',
+  processes:  'Live Processes',
 }
 
 export default function Header() {
@@ -34,20 +35,35 @@ export default function Header() {
 
   const platform = health?.platform || {}
   const captureMode = platform.capture_mode || 'unknown'
-  const isLive = captureMode === 'live_tetragon'
+  const isEbpf = captureMode === 'live_tetragon'
+  const isProcfs = captureMode === 'procfs_live'
+  // Both are live, but they are not the same thing. Rendering /proc capture as
+  // plain "LIVE" would imply eBPF fidelity we do not have, so each gets its
+  // own colour and its own label.
+  const isLive = isEbpf || isProcfs
   const arch = platform.source_arch || 'unknown'
 
-  const captureLabel = isLive
-    ? 'LIVE'
-    : captureMode === 'fixture_replay'
-      ? 'FIXTURE REPLAY'
-      : captureMode.toUpperCase().replace(/_/g, ' ')
+  const captureLabel = isEbpf
+    ? 'LIVE · eBPF'
+    : isProcfs
+      ? 'LIVE · /proc'
+      : captureMode === 'fixture_replay'
+        ? 'FIXTURE REPLAY'
+        : captureMode.toUpperCase().replace(/_/g, ' ')
 
-  const captureStyle = isLive
+  const captureStyle = isEbpf
     ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
-    : captureMode === 'fixture_replay'
-      ? 'text-amber-400 border-amber-500/30 bg-amber-500/10'
-      : 'text-muted-foreground border-border bg-muted/30'
+    : isProcfs
+      ? 'text-sky-400 border-sky-500/30 bg-sky-500/10'
+      : captureMode === 'fixture_replay'
+        ? 'text-amber-400 border-amber-500/30 bg-amber-500/10'
+        : 'text-muted-foreground border-border bg-muted/30'
+
+  const captureTitle = isEbpf
+    ? 'Live kernel-level telemetry from Tetragon/eBPF'
+    : isProcfs
+      ? 'Live process state polled from /proc — NOT eBPF. Short-lived processes can be missed and syscalls are not observable.'
+      : 'Replaying stored fixtures — not a live sensor'
 
   return (
     <header className="h-16 min-h-[4rem] flex flex-row items-center justify-between px-6 border-b border-border bg-background backdrop-blur-md sticky top-0 z-50">
@@ -61,10 +77,10 @@ export default function Header() {
       {/* Right: platform truth + system status */}
       <div className="flex items-center gap-4">
         <span
-          title={`Capture mode: ${captureMode} · source: ${platform.event_source || 'unknown'} · schema: ${platform.schema_version || 'unknown'}`}
+          title={`${captureTitle}\n\nCapture mode: ${captureMode} · source: ${platform.event_source || 'unknown'} · schema: ${platform.schema_version || 'unknown'}`}
           className={`flex items-center gap-1.5 text-[10px] font-mono font-bold tracking-wider px-2 py-1 rounded border ${captureStyle}`}
         >
-          <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+          <span className={`w-1.5 h-1.5 rounded-full ${isEbpf ? 'bg-emerald-400 animate-pulse' : isProcfs ? 'bg-sky-400 animate-pulse' : 'bg-amber-400'}`} />
           {captureLabel}
         </span>
 

@@ -198,14 +198,45 @@ def stream_from_stdin(publisher: EventPublisher, config: Config) -> int:
     return processed_count
 
 
+def stream_from_procfs(publisher: EventPublisher, config: Config) -> int:
+    """
+    Poll /proc and emit events for process creation, exec-in-place, and exit.
+
+    This is the live capture path used on IBM LinuxONE, where Tetragon cannot
+    run. It is not eBPF and does not claim to be: see forwarder/procfs_sensor.py
+    for the precise capability boundary.
+    """
+    from .procfs_sensor import ProcfsSensor
+
+    sensor = ProcfsSensor(config)
+    processed = 0
+    try:
+        for raw in sensor.run():
+            if _shutdown.is_set():
+                break
+            event = process_line(
+                json.dumps(raw),
+                publisher,
+                capture_mode="procfs_live",
+                config=config,
+            )
+            if event is not None:
+                processed += 1
+    finally:
+        sensor.stop()
+        logger.info("✅ procfs sensor stopped (%d events processed)", processed)
+    return processed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Security-Core Event Forwarder — Unified eBPF/Replay Ingestion Pipeline"
+        description="Security-Core Event Forwarder — Unified eBPF/Procfs/Replay Ingestion Pipeline"
     )
     parser.add_argument(
         "--mode", "-m",
-        choices=["live_tetragon", "fixture_replay", "stdin", "live", "replay"],
-        help="Ingestion mode: 'live_tetragon', 'fixture_replay', or 'stdin'",
+        choices=["live_tetragon", "fixture_replay", "stdin", "procfs", "live", "replay"],
+        help="Ingestion mode: 'live_tetragon', 'procfs' (live /proc sensor), "
+             "'fixture_replay', or 'stdin'",
     )
     parser.add_argument(
         "--file", "-f",
@@ -235,6 +266,8 @@ def main() -> None:
             mode = "fixture_replay"
         elif args.mode == "stdin":
             mode = "stdin"
+        elif args.mode == "procfs":
+            mode = "procfs"
     elif args.file:
         mode = "fixture_replay"
     elif args.stdin:
@@ -278,6 +311,8 @@ def main() -> None:
             stream_from_file(file_to_replay, publisher, config)
         elif mode == "stdin":
             stream_from_stdin(publisher, config)
+        elif mode == "procfs":
+            stream_from_procfs(publisher, config)
         elif mode == "live_tetragon":
             stream_from_tetra(config, publisher)
         else:

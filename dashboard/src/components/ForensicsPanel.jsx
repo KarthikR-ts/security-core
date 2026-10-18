@@ -452,7 +452,7 @@ function TelemetryGrid({ event }) {
     ['Event ID',       event.event_id?.slice(0, 18) + '…', ''],
     ['Timestamp',      event.timestamp, ''],
     ['Event Type',     event.event_type, ''],
-    ['Capture Mode',   event.capture_mode || event.platform?.capture_mode || '—', event.capture_mode === 'live_tetragon' ? 'text-emerald-500 font-semibold' : 'text-amber-500 font-semibold'],
+    ['Capture Mode',   event.capture_mode || event.platform?.capture_mode || '—', event.capture_mode === 'live_tetragon' ? 'text-emerald-500 font-semibold' : event.capture_mode === 'procfs_live' ? 'text-sky-400 font-semibold' : 'text-amber-500 font-semibold'],
     ['Arch / Host',    `${event.source_arch || event.platform?.source_arch || '—'} · ${event.source_host || event.platform?.source_host || '—'}`, ''],
     ['Redacted',       (event.privacy?.redacted_fields || []).length > 0 ? event.privacy.redacted_fields.join(', ') : 'none', (event.privacy?.redacted_fields || []).length > 0 ? 'text-amber-500' : ''],
     ['Node',           event.node_name, ''],

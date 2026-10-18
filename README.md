@@ -112,6 +112,72 @@ Built around a high-performance **eBPF telemetry kernel**, Workload Security rep
 
 ---
 
+## 📡 Capture Modes — what is actually observing
+
+Being precise about the sensor is the most important honesty property in this
+project. There are three ingestion modes, and they are **not** equivalent.
+
+| Mode | Flag | `capture_mode` | What it sees | Works on `s390x` |
+|---|---|---|---|---|
+| Fixture replay | `--mode fixture_replay` | `fixture_replay` | Stored records. Not a sensor. | yes |
+| Live eBPF | `--mode live_tetragon` | `live_tetragon` | Kernel `execve`/`connect()` as they happen | **no** |
+| Live `/proc` | `--mode procfs` | `procfs_live` | Process state on a poll interval | yes |
+
+**Why two "live" modes?** Upstream Tetragon publishes no `linux/s390x`
+release and the Datathon LinuxONE instance has no container runtime, so an
+eBPF DaemonSet cannot be deployed there. The `/proc` sensor is the
+alternative: an unprivileged poller that reads the process table directly.
+
+It is a real sensor and is reported as live, but it is **not eBPF** and never
+claims to be:
+
+| | eBPF | `/proc` poll |
+|---|---|---|
+| Sees `execve` as it happens | yes | no — only a diff on the next poll |
+| Sees `connect()` | yes | **no** |
+| Misses short-lived processes | no | **yes**, between polls |
+| Privileges | privileged + host mounts | unprivileged |
+
+The API reports this as two distinct fields — `sensor_kind` and
+`sensor_is_ebpf` — and the UI renders `/proc` capture in its own colour with
+a visible "not eBPF" disclosure. A single `LIVE` badge would overstate it.
+
+### `/proc` sensor privacy defaults
+
+A live command-line sensor on a shared host can capture credential-bearing
+daemons, so three defaults narrow that exposure:
+
+1. **Kernel threads** are always skipped.
+2. **Self-exclusion** — the sensor never observes itself or its ancestors.
+3. **`PROCFS_DENYLIST`** — exact match on `/proc/PID/comm`, not the command
+   line, so it cannot be evaded by padding argv. Default:
+   `sshd,cron,unattended-upgrades,systemd`.
+
+Set `PROCFS_DENYLIST=` for full coverage, which means opting in to capturing
+interactive login sessions. Everything the sensor emits still passes through
+write-time redaction before it reaches Redis.
+
+---
+
+## 🚀 One-command demo (Windows → LinuxONE)
+
+```powershell
+.\scripts\start-demo.ps1
+```
+
+Opens an SSH tunnel, waits for the API, prints what the remote actually
+reports, and opens **http://localhost:8080**.
+
+The dashboard API serves both the JSON API and the built React bundle, so UI
+and API are same-origin — no Vite dev server, no second port. The remote host
+has no `node`, so the bundle is built on the workstation:
+
+```powershell
+cd dashboard; npm ci; npm run build
+```
+
+---
+
 ## 🏗️ System Components & Service Ports
 
 | Service | Port | Description | Tech Stack |
@@ -272,11 +338,15 @@ To deploy Workload Security on a live Kubernetes cluster with active kernel trac
 - `POST /ingest` — Ingest external security reports or threat intelligence into the vector DB
 
 ### Dashboard API (`:8080`)
-- `GET /events/stream` — Real-time Server-Sent Events (SSE) telemetry feed
-- `GET /incidents` — Historical incident ledger with triage classifications
-- `POST /remediation/approve` — Human-in-the-loop approval gate for pending mitigation actions
-- `POST /remediation/execute` — Execute autonomous containment (SIGKILL, quarantine, NetworkPolicy)
-- `GET /forensics/{event_id}` — Detailed process tree and kernel telemetry details
+- `GET /` — Built React bundle (when `dashboard/dist` is present), else a JSON pointer
+- `GET /api/health` — Status, components, and truthful platform/sensor block
+- `GET /api/procs` — Live process snapshot read from `/proc` on this host
+- `GET /api/system` — Load, uptime, memory, kernel, architecture
+- `GET /api/events` — Enriched event list for the incident ledger
+- `GET /api/metrics` — Aggregated metrics and severity breakdown
+- `WS /api/ws/events` — Real-time event push
+- `POST /api/remediation/approve` — Human-in-the-loop approval gate
+- `GET /api/explain/{event_id}` — Explanation and provenance for an event
 
 ### Forwarder API (`:8081`)
 - `GET /health` — Event forwarder and Redis connection status

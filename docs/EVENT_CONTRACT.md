@@ -41,8 +41,66 @@
 | **Fixture Replay** | `--mode fixture_replay` or `--file <path>` | `"fixture_replay"` | `"tetragon-replay"` | **Default mode**. Safe, reproducible demo on LinuxONE without live kernel tracing. |
 | **Standard Input** | `--mode stdin` or `--stdin` | `"stdin"` | `"tetragon-replay"` | Piped streams (`cat events.jsonl \| python -m forwarder.main --stdin`). |
 | **Live Tetragon** | `--mode live_tetragon` or `--mode live` | `"live_tetragon"` | `"tetragon"` | Connects to `tetra` CLI / gRPC socket. Never claimed unless live kernel tracing is proven active. |
+| **Live /proc Sensor** | `--mode procfs` | `"procfs_live"` | `"procfs"` | Polls `/proc` on the local host. Used on IBM LinuxONE, where Tetragon cannot run. **Not eBPF** — see §2.1. |
 
-> **Critical Rule:** Replay and fixture events are **never** labeled as `"live_tetragon"`.
+> **Critical Rule:** Replay and fixture events are **never** labeled as `"live_tetragon"`
+> or `"procfs_live"`. Conversely, `"procfs_live"` is **never** presented as
+> eBPF — it is a weaker sensor and the contract says so.
+
+### 2.1 `procfs_live` capability boundary
+
+`procfs_live` is a genuine live sensor and must be labelled as one, but it is
+**not** equivalent to `live_tetragon`. The difference is material:
+
+| | `live_tetragon` (eBPF) | `procfs_live` (/proc poll) |
+|---|---|---|
+| Mechanism | kernel eBPF probes | polls the process table |
+| Sees `execve` as it happens | yes | no — only a diff on the next poll |
+| Sees `connect()` and other syscalls | yes | **no** |
+| Misses short-lived processes | no | **yes**, between polls |
+| Privileges required | privileged, host mounts | **unprivileged** |
+| Works on `s390x` | no (no upstream build) | yes |
+
+Consumers must treat these as distinct. The API reports two separate fields
+rather than one boolean:
+
+```json
+{
+  "capture_mode": "procfs_live",
+  "sensor_kind": "procfs_poll",
+  "live_capture": true,
+  "sensor_is_ebpf": false
+}
+```
+
+A UI that collapsed these into a single "LIVE" indicator would overstate the
+weaker sensor. The shipped UI renders `/proc` capture in its own colour with
+an explicit "not eBPF" disclosure.
+
+### 2.2 /proc sensor privacy defaults
+
+A live command-line sensor on a shared host can capture credential-bearing
+daemons. Three defaults narrow that, all in `forwarder/config.py`:
+
+1. **Kernel threads are always skipped** — empty `cmdline` parented to PID 2,
+   plus bracketed `comm` names such as `[kworker/0:1]`.
+2. **Self-exclusion** — the sensor never observes itself or any of its
+   ancestors, which would otherwise create a self-sustaining feedback loop.
+3. **`PROCFS_DENYLIST`** — exact match against `/proc/PID/comm`, the
+   kernel-truncated process name rather than the command line, so it cannot be
+   evaded by padding argv. Default:
+   `sshd,cron,unattended-upgrades,systemd`.
+
+   Matching is **exact, not prefix**: `systemd` excludes PID 1 only, while
+   `systemd-journal`, `systemd-resolved` and friends stay visible, since those
+   are meaningful runtime behaviour.
+
+   Set `PROCFS_DENYLIST=` (empty) for full coverage, which means opting in to
+   capturing interactive login sessions.
+
+Everything the sensor emits still passes through `forwarder/redaction.py`
+before publication to Redis, exactly as every other source does. The sensor
+does **not** bypass the write-time redaction guarantee.
 
 ---
 
@@ -142,7 +200,7 @@ Consumers that do not know them must ignore them.
 |---|---|---|---|
 | `event_id` | `string` | **Yes** | Stable unique UUIDv4 identifier. |
 | `schema_version` | `string` | **Yes** | Contract version, e.g. `"1.0.0"`. |
-| `capture_mode` | `string` | **Yes** | `"fixture_replay"`, `"live_tetragon"`, or `"stdin"`. |
+| `capture_mode` | `string` | **Yes** | `"fixture_replay"`, `"live_tetragon"`, `"procfs_live"`, or `"stdin"`. |
 | `event_source` | `string` | **Yes** | `"tetragon"` (live) or `"tetragon-replay"` (offline/fixture). |
 | `source_host` | `string` | **Yes** | Privacy-safe node identifier (e.g. `"linuxone-node-01"`). |
 | `source_arch` | `string` | **Yes** | CPU architecture (e.g. `"s390x"`, `"x86_64"`). |

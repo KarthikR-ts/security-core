@@ -55,9 +55,18 @@ export default function EventDetail({ event, onClose }) {
                     letterSpacing: '0.05em',
                     padding: '2px 8px',
                     borderRadius: '4px',
-                    color: event.capture_mode === 'live_tetragon' ? 'var(--green, #34d399)' : 'var(--amber)',
-                    border: `1px solid ${event.capture_mode === 'live_tetragon' ? 'rgba(52, 211, 153, 0.3)' : 'rgba(251, 191, 36, 0.3)'}`,
+                    color: event.capture_mode === 'live_tetragon' ? 'var(--green, #34d399)'
+                      : event.capture_mode === 'procfs_live' ? '#38bdf8'
+                        : 'var(--amber)',
+                    border: `1px solid ${event.capture_mode === 'live_tetragon' ? 'rgba(52, 211, 153, 0.3)'
+                      : event.capture_mode === 'procfs_live' ? 'rgba(56, 189, 248, 0.3)'
+                        : 'rgba(251, 191, 36, 0.3)'}`,
                   }}
+                  title={event.capture_mode === 'procfs_live'
+                    ? 'Live /proc polling — not eBPF'
+                    : event.capture_mode === 'live_tetragon'
+                      ? 'Live eBPF via Tetragon'
+                      : 'Fixture replay'}
                 >
                   {event.capture_mode || event.platform?.capture_mode || 'unknown'}
                 </span>

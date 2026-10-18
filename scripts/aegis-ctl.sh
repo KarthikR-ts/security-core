@@ -5,9 +5,20 @@
 # All services bind to 127.0.0.1 only; reach them through an SSH tunnel:
 #   ssh -i <key> linux1@<host> -L 8080:127.0.0.1:8080
 #
-# Usage: bash scripts/aegis-ctl.sh {start|stop|restart|status}
+# Usage: bash scripts/aegis-ctl.sh {start|stop|restart|status} [replay|procfs]
+#
+# MODE is an argument (default: replay) so the whole invocation stays one
+# command over SSH:
+#   bash aegis-ctl.sh start procfs    # LIVE /proc sensor
+#   bash aegis-ctl.sh start replay    # deterministic fixtures
 
 set -uo pipefail
+
+MODE="${2:-replay}"
+if [ "$MODE" != "replay" ] && [ "$MODE" != "procfs" ]; then
+  echo "usage: $0 {start|stop|restart|status} [replay|procfs]" >&2
+  exit 1
+fi
 
 APP_DIR="${APP_DIR:-$HOME/aegis}"
 VENV="${VENV:-$APP_DIR/.venv/bin/python}"
@@ -64,13 +75,33 @@ start_redis() {
 }
 
 start_forwarder() {
-  # The forwarder has no API-only mode: it starts its API thread and then
-  # runs the ingestion stream to completion. Feeding it a named FIFO that a
-  # writer keeps open holds the process (and port 8081) alive indefinitely,
-  # while events keep arriving.
+  # MODE selects the ingestion source:
+  #   replay  - deterministic fixtures via a FIFO (default, fully offline)
+  #   procfs  - LIVE process sensor reading /proc on this host
+  #
+  # Neither mode needs a container runtime, which is what makes this the only
+  # workable path on the LinuxONE host.
+  #
+  # The forwarder has no API-only mode: it starts its API thread and then runs
+  # the ingestion stream to completion. Feeding it a named FIFO that a writer
+  # keeps open holds the process (and port 8081) alive indefinitely, while
+  # events keep arriving.
   #
   # --file <fifo> keeps capture_mode honestly reported as fixture_replay,
   # which a --stdin mode would not.
+
+  if [ "$MODE" = "procfs" ]; then
+    # Live sensor. Runs indefinitely; no FIFO needed because scan_once()
+    # blocks on its own poll interval.
+    ( setsid nohup "$VENV" -m forwarder.main \
+        --mode procfs \
+        > "$LOG_DIR/forwarder.log" 2>&1 < /dev/null & ) \
+      > /dev/null 2>&1 < /dev/null
+    sleep 5
+    echo "forwarder: LIVE procfs sensor started (interval=${PROCFS_POLL_INTERVAL:-2.0}s)"
+    return
+  fi
+
   rm -f "$FIFO"; mkfifo "$FIFO"
 
   # NOTE: the redirections apply to the whole subshell, not just the inner
@@ -122,5 +153,5 @@ case "${1:-status}" in
   stop)    stop_all ;;
   restart) stop_all; start_redis; start_forwarder; start_dashboard; status ;;
   status)  status ;;
-  *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+  *)       echo "usage: $0 {start|stop|restart|status} [replay|procfs]"; exit 1 ;;
 esac

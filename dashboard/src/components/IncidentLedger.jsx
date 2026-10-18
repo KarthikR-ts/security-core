@@ -136,7 +136,9 @@ export default function IncidentLedger() {
                 : 'text-amber-400 border-amber-500/30 bg-amber-500/10'
             }`}
           >
-            {captureMode === 'live_tetragon' ? 'LIVE' : captureMode.toUpperCase().replace(/_/g, ' ')}
+            {captureMode === 'live_tetragon' ? 'LIVE · eBPF'
+              : captureMode === 'procfs_live' ? 'LIVE · /proc'
+                : captureMode.toUpperCase().replace(/_/g, ' ')}
           </span>
           {redactedCount > 0 && (
             <span

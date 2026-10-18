@@ -8,26 +8,30 @@
 
 ## Pre-recording checklist (do this before hitting record)
 
-```bash
-# 1. Redis
-redis-server --port 6379            # new terminal, leave running
-
-# 2. Forwarder — deterministic fixture replay (never claims live capture)
-python -m forwarder.main --mode fixture_replay --file fixtures/sample-tetragon-raw.jsonl
-
-# 3. Dashboard API (port 8080)
-python dashboard_api.py
-
-# 4. Frontend (port 5173)
-cd dashboard && npm install && npm run dev
+```powershell
+# On your workstation — one command, one URL
+.\scripts\start-demo.ps1
 ```
 
-- [ ] Browser at `http://localhost:5173`, window 1600×900, zoom 100%.
-- [ ] Terminal font ≥ 14 pt, dark background.
+That opens the SSH tunnel, waits for the API, and opens
+**http://localhost:8080** with the live `/proc` sensor already running on the
+remote host. Keep the window open for the whole recording.
+
+If you need the deterministic fallback instead:
+
+```bash
+# On LinuxONE, before opening the tunnel
+bash ~/aegis/scripts/aegis-ctl.sh restart replay
+```
+
+- [ ] Browser at `http://localhost:8080`, window 1600×900, zoom 100%.
+- [ ] Sidebar shows **Live Processes**.
+- [ ] Header badge reads `LIVE · /proc` in sky blue — **not** green. Green
+      means eBPF, and this is not eBPF. If the badge says `FIXTURE REPLAY`
+      you are on the fallback; say so in the narration.
 - [ ] `curl -s localhost:8080/api/health | python -m json.tool` returns
-      `"capture_mode": "fixture_replay"` and a truthful `"source_arch"` —
-      `s390x` on LinuxONE, the real host arch on the recording machine (e.g.
-      `AMD64` on a laptop) — this is the evidence shot.
+      `"capture_mode": "procfs_live"`, `"sensor_kind": "procfs_poll"`,
+      `"sensor_is_ebpf": false`, and `"source_arch": "s390x"` — the evidence shot.
 - [ ] Close email/Slack/notifications.
 
 ---
@@ -48,12 +52,75 @@ host arch elsewhere), stream status.
 
 ### 0:20 – 0:45 · The honest-data point (stay on Command Center)
 
-> "First, provenance. Every event is tagged at ingestion: capture mode, source
-> architecture, schema version. If this were live Tetragon data the chip would
-> read LIVE — it doesn't, because it isn't. Judges shouldn't have to trust us on
-> that; the pipeline records it."
+> "Provenance first. Every event is tagged at ingestion: capture mode, source
+> architecture, schema version. This badge reads LIVE · /proc — that's a real
+> sensor polling this IBM Z machine's process table, but it is not eBPF, and
+> we don't colour it green. Green would mean Tetragon, and Tetragon publishes
+> no s390x build. The chip is blue because blue means /proc, and because /proc
+> has limits we don't hide: it sees process state on an interval, so it can
+> miss a process that lives less than two seconds, and it cannot see syscalls
+> at all. You shouldn't have to trust us on any of that — the pipeline records
+> it and the UI says it out loud."
 
-Hover the `FIXTURE REPLAY` chip to show the tooltip (source, schema).
+Hover the badge to show the tooltip, which states the limitation.
+
+### 0:45 – 1:15 · Live Processes (click Live Processes in the sidebar)
+
+> "This is the actual process table, read live from /proc on the s390x host —
+> two vCPUs under z/VM. Every row is a real process. Two things worth noticing:
+> the architecture block reads s390x because that's measured on the running
+> host, not configured. And the count is lower than `ps` would give you,
+> because we've excluded kernel threads, the sensor's own shell lineage, and
+> anything on the denylist — which by default includes sshd, so this table
+> can't capture your login session. That's the project's thesis applied to the
+> sensor itself."
+
+Point at the arch block, the process count, then start a process from a second
+terminal to show a row appear:
+
+```bash
+sleep 90 &
+curl -s https://example.com -o /dev/null &
+```
+
+### 1:15 – 1:55 · Incident Ledger (click Ledger)
+
+> "The ledger is the triage queue. Red means verified threat. The shield icon on
+> a row means fields were redacted before this event was ever written to Redis —
+> hover it to see exactly which fields. And every grade carries its basis, which
+> here reads heuristic_rules, because XGBoost has no s390x wheel and we would
+> rather degrade honestly than pretend."
+
+**On screen:** filter to `TP`; hover the shield marker; hover a MITRE chip;
+click one row to open Forensics.
+
+### 1:55 – 2:15 · Forensics (Forensics Deep-Dive)
+
+> "The explainability layer: each signal that pushed the score, with its
+> weight. The confidence note says it plainly — signal strength, not a
+> probability. And the capture mode line reads procfs_live, so you always know
+> whether you're looking at a kernel event or a poll."
+
+### 2:15 – 2:40 · Remediation is a recommendation
+
+> "Remediation is staged, not fired. Human-in-loop, dry-run enforced. I request
+> remediation and the result is pending_approval — the YAML is validated and
+> ready, nothing applied, no kubectl call. And there is no kubectl on this box
+> to call."
+
+**On screen:** point at the `HUMAN-IN-LOOP · DRY-RUN` chip → click
+**Request Remediation** → amber result bar.
+
+### 2:40 – 2:50 · Close (terminal)
+
+```bash
+curl -s localhost:8080/api/health | python -m json.tool | head -30
+```
+
+> "One curl proves the platform story: architecture measured on the running
+> host — s390x on IBM LinuxONE — sensor kind, schema version, and the
+> remediation agent's safe defaults. Live telemetry you can audit, privacy you
+> can measure, remediation you can stop. Aegis Sentinel."
 
 ### 0:45 – 1:25 · Incident Ledger (click Ledger in the sidebar)
 
@@ -107,10 +174,11 @@ curl -s localhost:8080/api/health | python -m json.tool | head -30
 
 | Trap | Why it must not appear |
 |---|---|
+| Calling `/proc` capture "eBPF" or showing it in green | It is not eBPF. The badge is blue for exactly this reason. Overstating it is the single easiest way to lose a technical judge. |
+| "Live kernel monitoring on IBM Z" | The kernel would support it; Tetragon has no s390x build. Say "live process state", not "kernel-level". |
 | "Neutralize & Patch" executed for real | Nothing executes without human approval; claiming otherwise falsifies the safety story. |
-| Live Tetragon claimed from replay | `capture_mode` says `fixture_replay`; contradicting it is dishonest and detectable. |
 | "94% true positive" phrasing | Confidence is signal strength, not probability. The UI and script never say "chance". |
-| Real credentials/IPs | All events shown are fixtures, already redacted at ingestion. |
+| Real credentials/IPs | The denylist excludes sshd; everything shown is already redacted at ingestion. |
 
 ---
 

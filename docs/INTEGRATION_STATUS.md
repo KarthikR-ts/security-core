@@ -9,7 +9,8 @@ still blocked. Update this when the state changes; it is submitted as-is.
 
 ## 0. Platform Deployment Status — NEW
 
-The application stack is **deployed and verified on IBM LinuxONE (`s390x`)**.
+The application stack is **deployed and verified on IBM LinuxONE (`s390x`)**,
+running a **live process sensor**.
 
 | Property | Value |
 |---|---|
@@ -19,18 +20,34 @@ The application stack is **deployed and verified on IBM LinuxONE (`s390x`)**.
 | Deployment mode | Native install — **no container runtime on this host** |
 | Health endpoint | `"status": "ok"` |
 | Smoke test | `ALL SMOKE TEST ASSERTIONS PASSED (100% SUCCESS)` |
-| Capture mode | `fixture_replay` (`live_capture: false`) |
+| **Capture mode** | **`procfs_live`** — live `/proc` sensor, 2 s interval |
+| **Sensor kind** | `procfs_poll` · `sensor_is_ebpf: false` · `live_capture: true` |
+| Processes observed | ~27–30 visible, ~350 MB resident |
 | Public listeners | **None.** 6379 / 8080 / 8081 all bound to `127.0.0.1` |
+| Single-URL access | `.\scripts\start-demo.ps1` → `http://localhost:8080` |
 
-**Live eBPF is unavailable and this is a proven finding, not an assumption.**
-The kernel gate *passed* — 4,324 BPF symbols, the `bpf()` syscall present
-(`EINVAL`, not `ENOSYS`), and `tracefs`/`debugfs` both mounted read-write.
-The blocker is upstream: no container runtime exists on the host, and upstream
-Tetragon v1.2.0 publishes **no `s390x` release asset** (amd64 and arm64 only).
+**Live capture is available — via `/proc`, not via eBPF.** The kernel gate
+*passed* (§5 of the preflight): 4,324 BPF symbols, the `bpf()` syscall
+present (`EINVAL`, not `ENOSYS`), and `tracefs`/`debugfs` both mounted
+read-write. The blocker for Tetragon is upstream: no container runtime on the
+host, and Tetragon v1.2.0 publishes **no `s390x` release asset**.
 
-ML triage runs in heuristic mode because XGBoost has no `s390x` wheel. This is
-the documented fallback, verified at runtime, and `triage.basis` records
-`heuristic_rules` so no consumer can mistake it for a model probability.
+`forwarder/procfs_sensor.py` fills that gap with an unprivileged poller. It is
+reported as live and reported as *not eBPF* — `sensor_kind` and
+`sensor_is_ebpf` are separate fields, and the UI discloses the limitation
+rather than rendering a single `LIVE` badge.
+
+Verified on the host:
+
+```text
+contract valid   : 45/45 events
+capture_mode     : procfs_live          event_source: procfs
+denylist enforced: sshd excluded, none leaked
+self-exclusion   : own PID present in excluded lineage
+```
+
+ML triage runs in heuristic mode because XGBoost has no `s390x` wheel — the
+documented fallback, with `triage.basis` recording `heuristic_rules`.
 
 Full evidence: [`docs/LINUXONE_PREFLIGHT.md`](LINUXONE_PREFLIGHT.md).
 
@@ -183,6 +200,12 @@ python -m pytest forwarder/tests tests -v
 | **2026-10-18** | **IBM LinuxONE `s390x`** | `pytest forwarder/tests tests/test_dashboard_api.py tests/test_remediation_safety.py` | ✅ **58 passed, 0 failed** — core pipeline + Person 3/4 acceptance suites fully green |
 | **2026-10-18** | **IBM LinuxONE `s390x`** | `pytest forwarder/tests tests` (full) | 63 passed, 29 failed, 18 errors — all remaining failures are the opt-in RAG path, see §8 |
 | **2026-10-18** | **IBM LinuxONE `s390x`** | clean-room venv from `requirements-s390x.txt` | ✅ 14/14 packages resolved to prebuilt `s390x` wheels; pydantic pin held |
+| **2026-10-18** | **IBM LinuxONE `s390x`** | `pytest forwarder/tests` (incl. `/proc` sensor) | ✅ **56 passed** |
+| **2026-10-18** | **IBM LinuxONE `s390x`** | `python -m forwarder.main --mode procfs` | ✅ **LIVE** — 41 processes in first scan, `capture_mode: procfs_live` |
+| **2026-10-18** | **IBM LinuxONE `s390x`** | `GET /api/health` (procfs mode) | ✅ `sensor_kind: procfs_poll` · `sensor_is_ebpf: false` · `live_capture: true` · `source_arch: s390x` |
+| **2026-10-18** | **IBM LinuxONE `s390x`** | `GET /api/procs` | ✅ 30 processes, `is_s390x: true`, 352 MB resident |
+| **2026-10-18** | **IBM LinuxONE `s390x`** | `GET /api/system` | ✅ load, uptime, memory, kernel `6.8.0-147-generic` |
+| **2026-10-18** | **Windows → LinuxONE** | `.\scripts\start-demo.ps1` | ✅ **single URL `http://localhost:8080`** serves UI + API through one tunnel |
 
 ### Acceptance suites — the result that matters
 

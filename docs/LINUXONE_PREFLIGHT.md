@@ -213,23 +213,46 @@ environment. This is a proven finding, not an unverified assumption.**
 
 ## 7. Deployment option decision
 
-### Decision: **Option C — LinuxONE-hosted replay**
+### Decision: **Option C, upgraded — LinuxONE-hosted live `/proc` capture**
 
 | Option | Requirement | Result |
 |---|---|---|
 | A — all on LinuxONE | Privileged containers, host mounts, Tetragon s390x image | **Rejected** — no container runtime (§6.1), no s390x Tetragon (§6.2) |
-| B — LinuxONE + external sensor | LinuxONE can host app, separate host runs Tetragon | **Rejected for this submission** — requires a second continuously-available host and an authenticated network path; not available within the event window |
-| C — LinuxONE-hosted replay | Fixtures through the identical pipeline | **Selected** — fully achievable, already built, honestly labelled |
+| B — LinuxONE + external sensor | LinuxONE can host app, separate host runs Tetragon | **Rejected** — requires a second continuously-available host and an authenticated network path |
+| C — LinuxONE-hosted replay | Fixtures through the identical pipeline | **Achievable** |
+| **C+ — LinuxONE-hosted live `/proc` capture** | Unprivileged process-table polling | **Selected** |
 
 **The kernel supports eBPF (§5). The limitation is upstream of the platform,
 in Tetragon's release matrix and the absence of a container runtime.** This
 distinction is stated deliberately: claiming "eBPF does not work on s390x"
 would be inaccurate, and claiming "eBPF works on LinuxONE" would be false.
 
-Per `docs/EVENT_CONTRACT.md` §2, replay events carry
-`capture_mode: "fixture_replay"` and `event_source: "tetragon-replay"`, and
-are **never** labelled `live_tetragon`. This is enforced in code and asserted
-by the smoke test.
+### Why C+ rather than plain replay
+
+Since the constraint is tooling rather than platform, live capture is still
+reachable without eBPF. `forwarder/procfs_sensor.py` polls `/proc` and emits
+the same unified schema through the same redaction path. That turns the demo
+from *"fixtures replayed on s390x"* into **live process telemetry captured
+natively on IBM Z**, which is a materially stronger and more honest result.
+
+The capability boundary is stated everywhere it matters rather than hidden:
+
+- It **cannot** observe `execve` at the instant it happens, only a diff on the
+  next poll.
+- It **cannot** observe `connect()` or any other syscall.
+- It **can** miss processes that start and exit between two polls.
+
+The API reports `sensor_kind: "procfs_poll"` and `sensor_is_ebpf: false`
+alongside `live_capture: true`, and the UI renders the `/proc` capture in its
+own colour with a visible "not eBPF" disclosure. Collapsing that into a single
+`LIVE` badge would overstate it.
+
+Both modes remain available and are switchable at runtime:
+
+```bash
+bash scripts/aegis-ctl.sh restart procfs   # live /proc sensor
+bash scripts/aegis-ctl.sh restart replay   # deterministic fixtures
+```
 
 ---
 
@@ -507,6 +530,10 @@ repository documentation.
 | 16 | `aegis-ctl.sh start` hung over SSH (background procs inherited stdout) | Redirected all fds on the detached subshells | **Script fix applied** |
 | 17 | `remediation_agent` reported `unavailable` | `prometheus-client` installed; agent now `active` | Resolved |
 | 18 | `remediation_agent` reported `unavailable` (2nd cause) | No `kubectl` on host. Expected — dry-run executes nothing regardless. | Accepted |
+| 19 | No live sensor was available on LinuxONE | Added `forwarder/procfs_sensor.py` — unprivileged `/proc` poller, `capture_mode: procfs_live` | Resolved |
+| 20 | No single URL — Vite dev server, tunnel, and API were separate | `dashboard_api.py` now serves `dashboard/dist`; `scripts/start-demo.ps1` gives one command, one URL | Resolved |
+| 21 | `/proc/PID/stat` has no UID field (field 24 is RSS) | UID read from `/proc/PID/status`; caught by a unit test rather than by inspection | Resolved |
+| 22 | Sensor could observe itself and the shell driving it | Self-lineage exclusion, bounded to 64 ancestors | Resolved |
 
 ### Open reproducibility gap
 

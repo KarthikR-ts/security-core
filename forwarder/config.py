@@ -25,6 +25,26 @@ class Config:
     TETRAGON_GRPC_ADDRESS: str = os.getenv("TETRAGON_GRPC_ADDRESS", "localhost:54321")
     TETRA_BIN: str = os.getenv("TETRA_BIN", "tetra")
 
+    # ── /proc Sensor ──────────────────────────────────────────────
+    # procfs_live is NOT eBPF. It polls the /proc process table and therefore
+    # observes process state rather than kernel events: it can miss processes
+    # that exit between two polls, and it cannot observe connect() or similar
+    # syscalls at all. It is cheap, unprivileged, and portable to s390x, which
+    # is what makes live capture possible on IBM LinuxONE at all.
+    PROCFS_POLL_INTERVAL: float = float(os.getenv("PROCFS_POLL_INTERVAL", "2.0"))
+    # Denylist is matched against /proc/PID/comm (the kernel-truncated process
+    # name), not the command line, so it cannot be evaded with a long argv.
+    # Matching is EXACT, not prefix: "systemd" excludes PID 1 only, while
+    # systemd-journal, systemd-resolved and friends stay visible — which is
+    # what you want, since those are meaningful runtime behaviour. Use
+    # substring semantics here and you hide everything.
+    # The default excludes credential-bearing daemons that would otherwise
+    # capture interactive login sessions. Set to an empty value for full
+    # coverage.
+    PROCFS_DENYLIST: str = os.getenv("PROCFS_DENYLIST", "sshd,cron,unattended-upgrades,systemd")
+    PROCFS_EMIT_EXITS: bool = os.getenv("PROCFS_EMIT_EXITS", "true").lower() in ("true", "1", "yes")
+    PROCFS_MAX_ARGS: int = int(os.getenv("PROCFS_MAX_ARGS", "64"))
+
     # ── Privacy & Redaction ───────────────────────────────────────
     PRIVACY_REDACTION_ENABLED: bool = os.getenv("PRIVACY_REDACTION_ENABLED", "true").lower() in ("true", "1", "yes")
     PRIVACY_POLICY: str = os.getenv("PRIVACY_POLICY", "standard")

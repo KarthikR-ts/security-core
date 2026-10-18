@@ -53,6 +53,20 @@ def clear_dedup_cache() -> None:
     _dedup_set.clear()
 
 
+def _event_source_for(capture_mode: str) -> str:
+    """
+    Map a capture mode to its event_source label.
+
+    Kept explicit rather than a two-way ternary because procfs_live is a third
+    source that is genuinely live but is NOT Tetragon. Collapsing it into the
+    replay bucket would misreport it; calling it "tetragon" would be a lie.
+    """
+    return {
+        "live_tetragon": "tetragon",
+        "procfs_live": "procfs",
+    }.get(capture_mode, "tetragon-replay")
+
+
 def transform_event(
     raw: dict[str, Any],
     capture_mode: str = "fixture_replay",
@@ -116,7 +130,7 @@ def transform_event(
         "event_id": str(event_id),
         "schema_version": cfg.SCHEMA_VERSION,
         "capture_mode": capture_mode,
-        "event_source": "tetragon" if capture_mode == "live_tetragon" else "tetragon-replay",
+        "event_source": _event_source_for(capture_mode),
         "source_host": cfg.SOURCE_HOST,
         "source_arch": cfg.SOURCE_ARCH,
         "timestamp": norm_timestamp,
