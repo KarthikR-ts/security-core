@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+"""
+Security-Core Security Orchestration System — LangGraph Module
+
+Pipeline nodes:
+  Node A: event_router   — Routes alerts based on classifier grade
+  Node B: rag_retriever   — Enriches alerts with MITRE + Azure context from Pinecone
+  Node C: report_generator — Generates incident report + YAML fix via Gemini LLM
+
+Public API:
+  analyze_alert(raw_event, guide_score, guide_grade, stream=False) -> dict
+"""
+
+import os
+import re
+import json
+import uuid
+import yaml
+import logging
+import time
+import traceback
+from typing import TypedDict, Optional, List, Dict, Any
+from dotenv import load_dotenv
+
+from langgraph.graph import StateGraph, END
+from pinecone import Pinecone
+from google import genai
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-pro")
+LLM_MODEL_FALLBACK = os.getenv("LLM_MODEL_FALLBACK", "gemini-2.0-flash")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY_2 = os.getenv("GOOGLE_API_KEY_2")
+GOOGLE_API_KEY_3 = os.getenv("GOOGLE_API_KEY_3")
+GOOGLE_API_KEYS = [k for k in [GOOGLE_API_KEY, GOOGLE_API_KEY_2, GOOGLE_API_KEY_3] if k]
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_HOST = os.getenv("PINECONE_INDEX_HOST")
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+
+MITRE_TOP_K = 3
+AZURE_TOP_K = 2
+OFFLINE_MODE = os.getenv("OFFLINE_MODE", "false").lower() == "true"
+
+# External enrichment (Gemini LLM + Pinecone RAG + HuggingFace embeddings) is
+# opt-in. When disabled (the default), the pipeline runs a fully deterministic
+# offline path: heuristic triage context + rule-based MITRE mapping + templated
+# report/YAML. Nothing leaves the host.
+EXTERNAL_ENRICHMENT_ENABLED = (
+    os.getenv("LLM_EXTERNAL_ENRICHMENT_ENABLED", "false").lower() == "true"
+)
+EXTERNAL_ENRICHMENT_DISABLED = OFFLINE_MODE or not EXTERNAL_ENRICHMENT_ENABLED
+
+# ============================================================================
+# THREAD-SAFE GLOBAL INITIALIZATION
+# ============================================================================
+
+ORCHESTRATOR_AVAILABLE = False
+_genai_client = None
+_pc_client = None
+_pc_index = None
+_llm = None
+_embeddings_model = None
+
+# --- HuggingFace Embeddings ---
+if not EXTERNAL_ENRICHMENT_DISABLED:
+    try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        _embeddings_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        logger.info(f"HuggingFace embeddings initialized ({EMBEDDING_MODEL_NAME})")
+    except Exception as e:
+        logger.exception("Failed to initialize HuggingFace embeddings")
+else:
+    logger.info("External enrichment disabled (set LLM_EXTERNAL_ENRICHMENT_ENABLED=true to enable). Running offline.")
+
+# --- Gemini Client (new google-genai SDK) ---
+if GOOGLE_API_KEYS and not EXTERNAL_ENRICHMENT_DISABLED:
+    try:
+        # Use first key for the SDK client (metrics/checks)
+        _genai_client = genai.Client(api_key=GOOGLE_API_KEYS[0])
+        
+        # Build LLM fallback chain across multiple keys and potentially models
+        llm_instances = []
+        
+        # Define models to rotate through
+        models = [LLM_MODEL, LLM_MODEL_FALLBACK]
+        
+        for key in GOOGLE_API_KEYS:
+            for model in models:
+                llm_instances.append(
+                    ChatGoogleGenerativeAI(
+                        model=model,
+                        api_key=key,
+                        temperature=0.3,
+                        max_tokens=2000
+                    )
+                )
+        
+        if llm_instances:
+            # Chain them: First one is primary, others are fallbacks
+            primary = llm_instances[0]
+            if len(llm_instances) > 1:
+                _llm = primary.with_fallbacks(llm_instances[1:])
+            else:
+                _llm = primary
+                
+            ORCHESTRATOR_AVAILABLE = True
+            logger.info(
+                f"Gemini chain initialized with {len(GOOGLE_API_KEYS)} keys "
+                f"and {len(llm_instances)} fallback permutations."
+            )
+    except Exception as e:
+        logger.exception("Failed to initialize Gemini client chain")
+else:
+    logger.warning("No GOOGLE_API_KEYS set or external enrichment disabled. Generative AI disabled.")
+
+# --- Pinecone Client (v3 SDK) ---
+if PINECONE_API_KEY and PINECONE_INDEX_HOST and not EXTERNAL_ENRICHMENT_DISABLED:
+    try:
+        _pc_client = Pinecone(api_key=PINECONE_API_KEY)
+        _pc_index = _pc_client.Index(host=PINECONE_INDEX_HOST)
+        logger.info(f"Pinecone index connected via host: {PINECONE_INDEX_HOST}")
+    except Exception as e:
+        logger.exception("Failed to initialize Pinecone client")
+else:
+    logger.warning("Pinecone keys not set or external enrichment disabled. RAG disabled.")
+
+# ============================================================================
+# STATE SCHEMA
+# ============================================================================
+
+class SecurityState(TypedDict):
+    raw_event: dict
+    event_id: str
+    guide_score: float
+    guide_grade: str
+    stream: bool
+    mitre_context: str
+    azure_context: str
+    mitre_techniques: list          # list of dicts: {id, name, tactic, url}
+    final_report: str
+    yaml_fix: str
+    severity: str
+    attack_type: str
+    fix_type: str
+    fix_description: str
+    error: str
+    # Remediation fields (Node D)
+    remediation_status: str         # "succeeded", "failed", "skipped", "dry_run"
+    remediation_action: str         # "SIGKILL", "YAML", or empty
+    remediation_timestamp: str      # ISO 8601 timestamp
+    remediation_error: str          # Error message if remediation failed
+    # Analysis provenance (explainability)
+    provenance: dict                # {external_enrichment, mitre_mapping, report_source, sanitized_input}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+MITRE_TECHNIQUE_PATTERN = re.compile(r"T\d{4}(?:\.\d{3})?")
+
+# Well-known technique name mapping (subset for common attacks)
+KNOWN_TECHNIQUES = {
+    "T1071": {"name": "Application Layer Protocol", "tactic": "Command and Control"},
+    "T1071.001": {"name": "Application Layer Protocol: Web Protocols", "tactic": "Command and Control"},
+    "T1059": {"name": "Command and Scripting Interpreter", "tactic": "Execution"},
+    "T1059.004": {"name": "Command and Scripting Interpreter: Unix Shell", "tactic": "Execution"},
+    "T1068": {"name": "Exploitation for Privilege Escalation", "tactic": "Privilege Escalation"},
+    "T1003": {"name": "OS Credential Dumping", "tactic": "Credential Access"},
+    "T1003.008": {"name": "OS Credential Dumping: /etc/passwd and /etc/shadow", "tactic": "Credential Access"},
+    "T1055": {"name": "Process Injection", "tactic": "Defense Evasion"},
+    "T1057": {"name": "Process Discovery", "tactic": "Discovery"},
+    "T1046": {"name": "Network Service Discovery", "tactic": "Discovery"},
+    "T1087": {"name": "Account Discovery", "tactic": "Discovery"},
+    "T1048": {"name": "Exfiltration Over Alternative Protocol", "tactic": "Exfiltration"},
+    "T1048.003": {"name": "Exfiltration Over Unencrypted Non-C2 Protocol", "tactic": "Exfiltration"},
+    "T1095": {"name": "Non-Application Layer Protocol", "tactic": "Command and Control"},
+    "T1105": {"name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+    "T1106": {"name": "Native API", "tactic": "Execution"},
+    "T1078": {"name": "Valid Accounts", "tactic": "Defense Evasion"},
+    "T1082": {"name": "System Information Discovery", "tactic": "Discovery"},
+    "T1552": {"name": "Unsecured Credentials", "tactic": "Credential Access"},
+    "T1552.001": {"name": "Unsecured Credentials: Credentials In Files", "tactic": "Credential Access"},
+    "T1611": {"name": "Escape to Host", "tactic": "Privilege Escalation"},
+    "T1610": {"name": "Deploy Container", "tactic": "Defense Evasion"},
+}
+
+
+def _technique_entry(tid: str) -> dict:
+    """Build a structured technique dict (id/name/tactic/url) for a technique ID."""
+    info = KNOWN_TECHNIQUES.get(tid, {"name": "Unknown Technique", "tactic": "Unknown"})
+    sub = tid.replace(".", "/") if "." in tid else tid
+    return {
+        "id": tid,
+        "name": info["name"],
+        "tactic": info["tactic"],
+        "url": f"https://attack.mitre.org/techniques/{sub}/",
+    }
+
+
+def map_mitre_offline(raw_event: dict) -> list[dict]:
+    """
+    Deterministic, rule-based MITRE ATT&CK mapping used when Pinecone RAG /
+    Gemini enrichment is disabled.
+
+    Rules are ordered by specificity: credential/secret paths, then known
+    tooling binaries, then syscall-level signals, then an event-type fallback.
+    The list of rules that matched is itself the explanation of the mapping.
+    """
+    process = str(raw_event.get("process", "")).lower()
+    binary = process.rsplit("/", 1)[-1]
+    syscall = str(raw_event.get("syscall", "")).lower()
+    file_path = str(raw_event.get("file_path", raw_event.get("path", ""))).lower()
+    args_raw = raw_event.get("args", [])
+    if isinstance(args_raw, list):
+        args = " ".join(str(a) for a in args_raw)
+    else:
+        args = str(args_raw)
+    target = f"{file_path} {args}".lower()
+
+    matched: list[str] = []
+
+    def _match(tid: str) -> None:
+        if tid and tid not in matched:
+            matched.append(tid)
+
+    # 1. Credential / secret access
+    if any(p in target for p in ("/etc/shadow", "/etc/gshadow")):
+        _match("T1003.008")
+    if "/etc/passwd" in target:
+        _match("T1087")
+    if any(p in target for p in (".ssh", "serviceaccount/token", "/var/run/secrets")):
+        _match("T1552.001")
+
+    # 2. Known tooling binaries
+    if binary in ("curl", "wget"):
+        _match("T1105")
+    if binary in ("nc", "ncat", "netcat", "socat") or "reverse" in target or "/dev/tcp/" in target:
+        _match("T1095")
+    if binary == "nmap":
+        _match("T1046")
+    if binary in ("ps", "top", "netstat", "ss", "lsof"):
+        _match("T1057")
+    if binary in ("mount", "nsenter", "runc"):
+        _match("T1611")
+
+    # 3. Syscall-level signals
+    if syscall == "execve":
+        _match("T1059.004" if binary in ("bash", "sh", "dash", "zsh") else "T1059")
+    if syscall in ("ptrace", "bpf"):
+        _match("T1055")
+    if syscall == "connect" and re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", target):
+        _match("T1071.001")
+    if syscall == "openat":
+        if "/proc/" in target:
+            _match("T1057")
+        elif "/etc/" in target:
+            _match("T1087")
+
+    # 4. Event-type fallback (still deterministic)
+    if not matched:
+        event_type = str(raw_event.get("event_type", ""))
+        if event_type == "process_exec":
+            _match("T1059")
+        elif event_type == "process_kprobe":
+            _match("T1106")
+
+    return [_technique_entry(tid) for tid in matched]
+
+def generate_safe_default_yaml(raw_event: dict) -> str:
+    """Generates a safe default K8s YAML if generation fails."""
+    pod_name = raw_event.get("pod_name", raw_event.get("pod", "affected-pod"))
+    namespace = raw_event.get("namespace", "default")
+    return f"""apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-{pod_name}-egress
+  namespace: {namespace}
+spec:
+  podSelector:
+    matchLabels:
+      app: {pod_name}
+  policyTypes:
+  - Egress
+  - Ingress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  ingress: []
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {pod_name}
+  namespace: {namespace}
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  containers:
+  - name: {pod_name}
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL"""
+
+
+def robust_yaml_extract(text: str, raw_event: dict) -> str:
+    """Robustly extracts YAML block and validates with pyyaml."""
+    yaml_str = None
+
+    for pattern in [r"```yaml\s*(.*?)\s*```", r"```YAML\s*(.*?)\s*```"]:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            yaml_str = match.group(1).strip()
+            break
+
+    if not yaml_str and "apiVersion:" in text:
+        yaml_str = "apiVersion:" + text.split("apiVersion:", 1)[1]
+        if "```" in yaml_str:
+            yaml_str = yaml_str.split("```")[0].strip()
+
+    if not yaml_str:
+        gen_match = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
+        if gen_match and "apiVersion:" in gen_match.group(1):
+            yaml_str = gen_match.group(1).strip()
+
+    if yaml_str:
+        try:
+            yaml.safe_load(yaml_str)
+            return yaml_str
+        except yaml.YAMLError as e:
+            logger.warning(f"Extracted YAML was invalid: {e}")
+
+    logger.warning("Falling back to safe default YAML template.")
+    return generate_safe_default_yaml(raw_event)
+
+
+def sanitize_event_for_llm(raw_event: dict) -> dict:
+    """
+    Strip secrets, tokens, and credentials from the raw event before any of its
+    values are placed in an LLM prompt. The full event stays local; only the
+    sanitized copy is sent to external (Gemini) enrichment.
+    """
+    try:
+        from forwarder.redaction import redact_string
+    except Exception:  # pragma: no cover - forwarder should always be importable
+        return raw_event
+
+    sanitized: dict = {}
+    for key, value in raw_event.items():
+        flagged: set[str] = set()
+        if isinstance(value, str):
+            sanitized[key] = redact_string(value, flagged, field_category=str(key))
+        elif isinstance(value, list):
+            sanitized[key] = [
+                redact_string(v, flagged, field_category=str(key)) if isinstance(v, str) else v
+                for v in value
+            ]
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
+def extract_mitre_techniques(text: str) -> list:
+    """Extract MITRE technique IDs from text and return structured objects."""
+    raw_ids = list(set(MITRE_TECHNIQUE_PATTERN.findall(text)))
+    return [_technique_entry(tid) for tid in raw_ids]
+
+
+def build_ultimate_fallback_report(state: SecurityState) -> str:
+    """Builds a relevant static report when all AI keys fail."""
+    raw_event = state.get("raw_event", {})
+    process = raw_event.get("process", "unknown")
+    syscall = raw_event.get("syscall", "unknown")
+    path = raw_event.get("file_path", raw_event.get("path", "unknown"))
+    pod = raw_event.get("pod_name", "unknown")
+    
+    attack_type = infer_attack_type(raw_event)
+    severity = infer_severity(state.get("guide_grade", "TP"), state.get("guide_score", 0.8))
+    
+    report = f"""REPORT: [AUTOMATED FALLBACK ANALYSIS]
+The system detected a high-risk '{attack_type}' event in pod '{pod}'. 
+The process '{process}' attempted a sensitive '{syscall}' operation on '{path}'. 
+This pattern is strongly associated with malicious activity. 
+Immediate inspection of the container and its network connections is advised.
+
+SEVERITY: {severity}
+ATTACK_TYPE: {attack_type}
+WHAT_HAPPENED: Process '{process}' triggered '{syscall}' on a sensitive path.
+POTENTIAL_IMPACT: Unauthorized access or control of the container environment.
+RECOMMENDED_ACTION: Quarantine the pod and review audit logs for further lateral movement.
+FIX_DESCRIPTION: Applies standard Kubernetes security hardening and network isolation.
+"""
+    return report
+
+
+def infer_severity(guide_grade: str, guide_score: float) -> str:
+    """Infer severity from grade + confidence."""
+    if guide_grade == "FP":
+        return "LOW"
+    if guide_grade == "BP":
+        return "MEDIUM" if guide_score > 0.7 else "LOW"
+    # TP
+    if guide_score >= 0.9:
+        return "CRITICAL"
+    elif guide_score >= 0.7:
+        return "HIGH"
+    elif guide_score >= 0.5:
+        return "MEDIUM"
+    return "LOW"
+
+
+def infer_attack_type(raw_event: dict) -> str:
+    """Infer attack type from syscall + process."""
+    syscall = raw_event.get("syscall", "").lower()
+    process = raw_event.get("process", "").lower()
+    file_path = raw_event.get("file_path", "").lower()
+
+    if "shadow" in file_path or "passwd" in file_path:
+        return "Credential Access"
+    if process in ("curl", "wget") and syscall == "connect":
+        return "Command and Control"
+    if process in ("nc", "ncat", "netcat") or "reverse" in process:
+        return "Reverse Shell"
+    if process in ("ps", "top", "netstat", "ss") and syscall == "execve":
+        return "Discovery"
+    if syscall == "connect" and "53" in str(raw_event.get("file_path", "")):
+        return "Data Exfiltration"
+    if syscall == "execve":
+        return "Execution"
+    if syscall == "openat":
+        return "File Access"
+    return "Suspicious Activity"
+
+
+def infer_fix_type(yaml_text: str) -> str:
+    """Infer the fix type from YAML content."""
+    if "NetworkPolicy" in yaml_text:
+        return "NetworkPolicy"
+    if "securityContext" in yaml_text or "PodSecurity" in yaml_text:
+        return "PodSecurityContext"
+    if "Role" in yaml_text or "ClusterRole" in yaml_text:
+        return "RBAC"
+    return "Other"
+
+
+# ============================================================================
+# NODES
+# ============================================================================
+
+def event_router(state: SecurityState) -> dict:
+    """Node A: Route alerts based on classifier grade."""
+    start_time = time.time()
+
+    try:
+        guide_grade = state.get("guide_grade", "")
+        guide_score = state.get("guide_score", 0.0)
+
+        if guide_grade == "FP":
+            result = {
+                **state,
+                "final_report": "Auto-suppressed: False Positive. No action needed.",
+                "yaml_fix": "",
+                "severity": "LOW",
+                "attack_type": "None (False Positive)",
+                "fix_type": "None",
+                "fix_description": "No remediation needed for false positive alerts.",
+                "provenance": {
+                    **state.get("provenance", {}),
+                    "report_source": "auto_suppressed",
+                    "mitre_mapping": "skipped",
+                    "external_enrichment": False,
+                },
+            }
+        elif guide_grade == "BP":
+            result = {
+                **state,
+                "mitre_context": f"[AUDIT LOG] BP classification at {guide_score} confidence"
+            }
+        else:
+            result = state
+
+        duration = (time.time() - start_time) * 1000
+        logger.info(
+            f"[NODE A] event_router       | grade={guide_grade}  "
+            f"| score={guide_score} | {duration:.0f}ms"
+        )
+        return result
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        logger.exception(f"[NODE A] event_router FAILED | {duration:.0f}ms")
+        return {**state, "error": str(e), "final_report": f"Error in event_router: {e}"}
+
+
+def rag_retriever(state: SecurityState) -> dict:
+    """Node B: Retrieve MITRE + Azure context from Pinecone."""
+    start_time = time.time()
+
+    try:
+        if state.get("final_report", "").startswith("Auto-suppressed"):
+            duration = (time.time() - start_time) * 1000
+            logger.info(f"[NODE B] rag_retriever      | SKIPPED (suppressed) | {duration:.0f}ms")
+            return state
+
+        raw_event = state.get("raw_event", {})
+
+        # ── Offline deterministic enrichment ──────────────────────────────
+        # When external enrichment is disabled (default) or the clients could
+        # not be initialized, do not fail the pipeline: apply the local
+        # rule-based MITRE mapping and record that provenance.
+        if not _pc_index or not _genai_client or not _embeddings_model:
+            techniques = map_mitre_offline(raw_event)
+            if techniques:
+                mitre_context = "\n".join(
+                    f"[{t['id']}] {t['name']} ({t['tactic']})" for t in techniques
+                )
+            else:
+                mitre_context = "No MITRE ATT&CK technique matched the deterministic rule set."
+
+            azure_context = "External enrichment disabled — CIS Azure benchmark context not retrieved."
+
+            duration = (time.time() - start_time) * 1000
+            logger.info(
+                f"[NODE B] rag_retriever      | OFFLINE rules | techniques={len(techniques)} "
+                f"| {duration:.0f}ms"
+            )
+            return {
+                **state,
+                "mitre_context": mitre_context,
+                "azure_context": azure_context,
+                "mitre_techniques": techniques,
+                "provenance": {
+                    **state.get("provenance", {}),
+                    "external_enrichment": False,
+                    "mitre_mapping": "offline_rules",
+                },
+            }
+
+        # Sanitize before values are embedded into Pinecone queries
+        safe_event = sanitize_event_for_llm(raw_event)
+        process_name = safe_event.get("process", "unknown_process")
+        syscall = safe_event.get("syscall", "unknown_syscall")
+        file_path = safe_event.get("file_path", safe_event.get("path", "unknown_path"))
+        alert_title = safe_event.get("alert_title", f"{process_name} {syscall} alert")
+
+        mitre_query = f"{process_name} {syscall} {file_path}"
+        azure_query = alert_title
+
+        # --- MITRE retrieval ---
+        mitre_context = "No MITRE ATT&CK context found."
+        try:
+            m_vec = _embeddings_model.embed_query(mitre_query)
+            mitre_results = _pc_index.query(
+                vector=m_vec, top_k=MITRE_TOP_K,
+                namespace="mitre", include_metadata=True
+            )
+            mitre_texts = []
+            for match in mitre_results.get('matches', []):
+                meta = match.get('metadata', {})
+                text = meta.get('text', '')
+                tid = meta.get('technique_id', '')
+                if text:
+                    mitre_texts.append(f"[{tid}] {text}" if tid else text)
+            if mitre_texts:
+                mitre_context = "\n".join(mitre_texts)
+        except Exception as e:
+            logger.warning(f"MITRE retrieval failed: {e}")
+            mitre_context = f"Error retrieving MITRE context: {e}"
+
+        # --- Azure retrieval ---
+        azure_context = "No Azure Security Benchmark context found."
+        try:
+            a_vec = _embeddings_model.embed_query(azure_query)
+            azure_results = _pc_index.query(
+                vector=a_vec, top_k=AZURE_TOP_K,
+                namespace="azure", include_metadata=True
+            )
+            azure_texts = [
+                m.get('metadata', {}).get('text', '')
+                for m in azure_results.get('matches', [])
+                if m.get('metadata', {}).get('text')
+            ]
+            if azure_texts:
+                azure_context = "\n".join(azure_texts)
+        except Exception as e:
+            logger.warning(f"Azure retrieval failed: {e}")
+            azure_context = f"Error retrieving Azure context: {e}"
+
+        duration = (time.time() - start_time) * 1000
+        logger.info(
+            f"[NODE B] rag_retriever      | mitre={len(mitre_context)} chars "
+            f"| azure={len(azure_context)} chars | {duration:.0f}ms"
+        )
+
+        return {
+            **state,
+            "mitre_context": mitre_context,
+            "azure_context": azure_context,
+            "provenance": {
+                **state.get("provenance", {}),
+                "external_enrichment": True,
+                "mitre_mapping": "pinecone_rag",
+            },
+        }
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        logger.exception(f"[NODE B] rag_retriever FAILED | {duration:.0f}ms")
+        return {**state, "error": str(e), "final_report": f"Error in rag_retriever: {e}"}
+
+
+def report_generator(state: SecurityState) -> dict:
+    """Node C: Generate incident report + YAML fix via Gemini LLM."""
+    start_time = time.time()
+
+    try:
+        if state.get("final_report", "").startswith("Auto-suppressed"):
+            duration = (time.time() - start_time) * 1000
+            logger.info(f"[NODE C] report_generator   | SKIPPED (suppressed) | {duration:.0f}ms")
+            return state
+
+        raw_event = state.get("raw_event", {})
+        guide_score = state.get("guide_score", 0.0)
+        guide_grade = state.get("guide_grade", "UNKNOWN")
+        mitre_context = state.get("mitre_context", "No MITRE context available.")
+        azure_context = state.get("azure_context", "No Azure context available.")
+
+        process_name = raw_event.get("process", "unknown")
+        syscall = raw_event.get("syscall", "unknown")
+        file_path = raw_event.get("file_path", raw_event.get("path", "unknown"))
+        timestamp = raw_event.get("timestamp", "unknown")
+        pod_name = raw_event.get("pod_name", raw_event.get("pod", "unknown"))
+        namespace = raw_event.get("namespace", "default")
+
+        severity = infer_severity(guide_grade, guide_score)
+        attack_type = infer_attack_type(raw_event)
+
+        if not _llm:
+            logger.info("LLM not configured. Using offline fallback.")
+            yaml_fix = generate_safe_default_yaml(raw_event)
+            mitre_techniques = (
+                state.get("mitre_techniques")
+                or extract_mitre_techniques(mitre_context)
+                or map_mitre_offline(raw_event)
+            )
+            mitre_display = ", ".join(t["id"] for t in mitre_techniques) or "no matched technique"
+            offline_report = (
+                f"Process '{process_name}' triggered '{syscall}' on '{file_path}' "
+                f"in pod '{pod_name}/{namespace}'. "
+                f"Grade: {guide_grade} ({guide_score:.2f} confidence). "
+                f"Severity: {severity}. Attack type: {attack_type}. "
+                f"MITRE ATT&CK (offline rule mapping): {mitre_display}."
+            )
+            fix_type = infer_fix_type(yaml_fix)
+            duration = (time.time() - start_time) * 1000
+            logger.info(f"[NODE C] report_generator   | OFFLINE | report={len(offline_report)} chars | {duration:.0f}ms")
+            return {
+                **state,
+                "final_report": offline_report,
+                "yaml_fix": yaml_fix,
+                "severity": severity,
+                "attack_type": attack_type,
+                "fix_type": fix_type,
+                "fix_description": f"Restricts network egress and applies security context hardening for pod '{pod_name}'.",
+                "mitre_techniques": mitre_techniques,
+                "provenance": {
+                    **state.get("provenance", {}),
+                    "report_source": "offline_template",
+                    "sanitized_input": False,
+                },
+            }
+
+        # Sanitize the user-controlled fields before they enter the LLM prompt.
+        # The raw event never leaves the host; only these scrubbed values do.
+        safe_prompt_fields = sanitize_event_for_llm({
+            "process": process_name,
+            "syscall": syscall,
+            "file_path": file_path,
+            "pod_name": pod_name,
+            "namespace": namespace,
+            "timestamp": timestamp,
+        })
+
+        user_prompt = f"""SECURITY ALERT ANALYSIS REQUEST
+
+EVENT DETAILS:
+- Process: {safe_prompt_fields['process']}
+- Syscall: {safe_prompt_fields['syscall']}
+- File/Path Accessed: {safe_prompt_fields['file_path']}
+- Pod: {safe_prompt_fields['pod_name']}
+- Namespace: {safe_prompt_fields['namespace']}
+- Timestamp: {safe_prompt_fields['timestamp']}
+
+CLASSIFIER INFORMATION:
+- Grade: {guide_grade}
+- Confidence Score: {guide_score}
+
+MITRE ATT&CK CONTEXT:
+{mitre_context}
+
+AZURE SECURITY BENCHMARK CONTEXT:
+{azure_context}
+
+TASK:
+Analyze this security alert and provide:
+1. A concise incident report (max 200 words) explaining the threat, its MITRE technique mapping, and potential impact
+2. A structured analysis with these exact fields (one per line, use the prefix labels):
+   SEVERITY: CRITICAL or HIGH or MEDIUM or LOW
+   ATTACK_TYPE: short label (e.g. "Privilege Escalation", "Command and Control")
+   WHAT_HAPPENED: one sentence
+   POTENTIAL_IMPACT: one sentence
+   RECOMMENDED_ACTION: one sentence
+3. A specific Kubernetes YAML patch to remediate or mitigate this issue
+4. A plain English description of what the YAML fix does (prefix with FIX_DESCRIPTION:)
+
+Format your response as:
+REPORT: [Your incident report here]
+
+SEVERITY: [value]
+ATTACK_TYPE: [value]
+WHAT_HAPPENED: [value]
+POTENTIAL_IMPACT: [value]
+RECOMMENDED_ACTION: [value]
+FIX_DESCRIPTION: [value]
+
+YAML FIX:
+```yaml
+[Your Kubernetes YAML patch here]
+```"""
+
+        system_prompt = (
+            "You are Security-Core's AI Security Analyst. You write precise, "
+            "expert-level incident reports for SOC teams. Be concise. Always cite "
+            "MITRE technique IDs. Always end with a YAML fix."
+        )
+
+        stream_enabled = state.get("stream", False)
+        full_response = ""
+
+        if stream_enabled:
+            logger.info("Streaming enabled — generating report token-by-token...")
+            for chunk in _llm.stream(f"{system_prompt}\n\n{user_prompt}"):
+                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                print(content, end="", flush=True)
+                full_response += content
+            print()
+        else:
+            response = _llm.invoke(f"{system_prompt}\n\n{user_prompt}")
+            full_response = response.content if hasattr(response, 'content') else str(response)
+
+        # Parse report
+        yaml_marker = "```yaml"
+        if yaml_marker in full_response.lower():
+            report_part = re.split(r"```[yY][aA][mM][lL]", full_response)[0].replace("REPORT:", "").strip()
+        else:
+            report_part = full_response.replace("REPORT:", "").strip()
+
+        final_report = report_part[:2000]
+        yaml_fix = robust_yaml_extract(full_response, raw_event)
+
+        # Extract structured fields from LLM response
+        def extract_field(text: str, field: str, default: str) -> str:
+            pattern = rf"{field}:\s*(.+?)(?:\n|$)"
+            match = re.search(pattern, text, re.IGNORECASE)
+            return match.group(1).strip() if match else default
+
+        llm_severity = extract_field(full_response, "SEVERITY", severity)
+        if llm_severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            severity = llm_severity
+
+        llm_attack_type = extract_field(full_response, "ATTACK_TYPE", attack_type)
+        if llm_attack_type and llm_attack_type != attack_type:
+            attack_type = llm_attack_type
+
+        fix_description = extract_field(
+            full_response, "FIX_DESCRIPTION",
+            f"Applies security hardening to pod '{pod_name}' in namespace '{namespace}'."
+        )
+
+        fix_type = infer_fix_type(yaml_fix)
+
+        # Extract MITRE techniques from both report and RAG context
+        all_text = f"{final_report}\n{mitre_context}"
+        mitre_techniques = extract_mitre_techniques(all_text)
+
+        duration = (time.time() - start_time) * 1000
+        logger.info(
+            f"[NODE C] report_generator   | report={len(final_report.split())} words "
+            f"| yaml={len(yaml_fix.splitlines())} lines | {duration:.0f}ms"
+        )
+
+        return {
+            **state,
+            "final_report": final_report,
+            "yaml_fix": yaml_fix,
+            "severity": severity,
+            "attack_type": attack_type,
+            "fix_type": fix_type,
+            "fix_description": fix_description,
+            "mitre_techniques": mitre_techniques,
+            "provenance": {
+                **state.get("provenance", {}),
+                "report_source": "llm",
+                "sanitized_input": True,
+            },
+        }
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        logger.error(f"[NODE C] report_generator LLM CHAIN FAILED | {duration:.0f}ms | {e}")
+        
+        # Build ultimate fallback report
+        fallback_text = build_ultimate_fallback_report(state)
+        yaml_fix = generate_safe_default_yaml(state.get("raw_event", {}))
+        
+        return {
+            **state,
+            "error": f"LLM Failure: {str(e)}",
+            "final_report": fallback_text,
+            "yaml_fix": yaml_fix,
+            "severity": infer_severity(state.get("guide_grade", "TP"), state.get("guide_score", 0.5)),
+            "attack_type": infer_attack_type(state.get("raw_event", {})),
+            "fix_type": infer_fix_type(yaml_fix),
+            "fix_description": "Default security hardening applied due to AI service disruption.",
+            "mitre_techniques": (
+                state.get("mitre_techniques")
+                or extract_mitre_techniques(state.get("mitre_context", ""))
+                or map_mitre_offline(state.get("raw_event", {}))
+            ),
+            "provenance": {
+                **state.get("provenance", {}),
+                "report_source": "fallback",
+            },
+        }
+
+
+# ============================================================================
+# GRAPH ROUTING & CONSTRUCTION
+# ============================================================================
+
+def continue_or_end(state: SecurityState) -> str:
+    if state.get("error") or state.get("final_report", "").startswith("Auto-suppressed"):
+        return END
+    return "rag_retriever"
+
+def rag_or_end(state: SecurityState) -> str:
+    if state.get("error"):
+        return END
+    return "report_generator"
+
+def report_or_end(state: SecurityState) -> str:
+    return END
+
+def remediation_or_end(state: SecurityState) -> str:
+    """
+    Route to remediation_agent for TP events, otherwise END.
+    
+    Requirements: 1.1, 1.2, 1.3, 2.1, 2.2, 2.3
+    """
+    guide_grade = state.get("guide_grade", "")
+    
+    # Only route TP events to remediation
+    if guide_grade == "TP":
+        logger.debug(f"Routing TP event to remediation_agent")
+        return "remediation_agent"
+    
+    # BP, FP, or missing grade skip remediation
+    logger.debug(f"Skipping remediation for grade={guide_grade}")
+    return END
+
+def build_security_graph() -> StateGraph:
+    logger.info("Building Security-Core LangGraph workflow...")
+    workflow = StateGraph(SecurityState)
+    workflow.add_node("event_router", event_router)
+    workflow.add_node("rag_retriever", rag_retriever)
+    workflow.add_node("report_generator", report_generator)
+    
+    # Import remediation_agent dynamically to avoid circular imports
+    # The actual node will be added when remediation module is complete
+    try:
+        from remediation.agent import remediation_agent
+        workflow.add_node("remediation_agent", remediation_agent)
+        logger.info("Remediation agent node registered")
+    except ImportError:
+        logger.warning("Remediation agent not available - skipping node registration")
+        # Define a placeholder that just passes through
+        def remediation_placeholder(state: SecurityState) -> dict:
+            logger.info("Remediation agent placeholder - no action taken")
+            return {
+                **state,
+                "remediation_status": "skipped",
+                "remediation_action": "",
+                "remediation_timestamp": "",
+                "remediation_error": "Remediation module not installed"
+            }
+        workflow.add_node("remediation_agent", remediation_placeholder)
+
+    workflow.set_entry_point("event_router")
+
+    workflow.add_conditional_edges("event_router", continue_or_end)
+    workflow.add_conditional_edges("rag_retriever", rag_or_end)
+    # Updated: report_generator now routes to remediation for TP events
+    workflow.add_conditional_edges("report_generator", remediation_or_end)
+    # remediation_agent always routes to END
+    workflow.add_edge("remediation_agent", END)
+
+    logger.info("LangGraph workflow built successfully")
+    return workflow.compile()
+
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
+
+_shared_graph = build_security_graph()
+
+
+def analyze_alert(raw_event: dict, guide_score: float, guide_grade: str, stream: bool = False) -> dict:
+    """
+    Public API for analyzing a security alert through the full pipeline.
+
+    Args:
+        raw_event: Dictionary describing the security event.
+        guide_score: Confidence score from the classifier (0.0-1.0).
+        guide_grade: Triage grade ('TP', 'BP', 'FP').
+        stream: Whether to stream LLM generation tokens to stdout.
+
+    Returns:
+        A dict containing final_report, yaml_fix, severity, attack_type,
+        fix_type, fix_description, mitre_techniques, and error fields.
+    """
+    initial_state: SecurityState = {
+        "raw_event": raw_event,
+        "event_id": str(raw_event.get("event_id") or uuid.uuid4()),
+        "guide_score": guide_score,
+        "guide_grade": guide_grade,
+        "stream": stream,
+        "mitre_context": "",
+        "azure_context": "",
+        "mitre_techniques": [],
+        "final_report": "",
+        "yaml_fix": "",
+        "severity": "",
+        "attack_type": "",
+        "fix_type": "",
+        "fix_description": "",
+        "error": "",
+        # Initialize remediation fields
+        "remediation_status": "",
+        "remediation_action": "",
+        "remediation_timestamp": "",
+        "remediation_error": "",
+        # Analysis provenance — updated by each node
+        "provenance": {
+            "external_enrichment": False,
+            "mitre_mapping": "pending",
+            "report_source": "pending",
+            "sanitized_input": False,
+        },
+    }
+
+    initial_state["stream"] = stream
+    return _shared_graph.invoke(initial_state)
+
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("SECURITY-CORE ORCHESTRATOR — TEST MODE")
+    print("=" * 80)
+
+    mock_event = {
+        "process": "runc",
+        "syscall": "execve",
+        "file_path": "/bin/sh",
+        "pod_name": "vulnerable-app-7d8f9c",
+        "namespace": "production",
+        "timestamp": "2026-03-06T14:32:15Z",
+        "alert_title": "Suspicious execve from runc in container",
+        "user": "root",
+        "uid": 0
+    }
+
+    logger.info("TESTING: analyze_alert() — TP EVENT (STREAMING=TRUE)")
+    res = analyze_alert(mock_event, 0.92, "TP", stream=True)
+
+    print("\n" + "=" * 80)
+    print("RESULTS")
+    print("=" * 80)
+
+    print("\n📋 FINAL REPORT:")
+    print("-" * 80)
+    print(res.get("final_report"))
+
+    print("\n🔧 YAML FIX:")
+    print("-" * 80)
+    print(res.get("yaml_fix"))
+
+    print("\n🎯 MITRE TECHNIQUES:")
+    print("-" * 80)
+    for tech in res.get("mitre_techniques", []):
+        print(f"  {tech['id']} — {tech['name']} ({tech['tactic']})")

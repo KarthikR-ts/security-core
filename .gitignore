@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*_pid.txt
+
+
+# Environment
+.env
+.env.local
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local tooling artifacts
+.openchamber/
+
+# Node (for teammates)
+node_modules/
+
+# Docker
+*.log
+
+# Kubernetes
+kubeconfig
+
+# Binaries
+bin/
+
+# Models and Large Data
+xgboost_model.json
+*.model
+*.joblib
+*.pkl
+
+
+

@@ -1,0 +1,128 @@
+# docker-compose.yml — Security-Core Full Stack
+# Runs all services for the complete Detection → Remediation workflow.
+
+version: "3.9"
+
+services:
+  # ── Redis (Event Stream + Audit Trail) ──────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: security-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  # ── Event Forwarder API (port 8081) ─────────────────────────
+  forwarder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: security-forwarder
+    ports:
+      - "8081:8081"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FORWARDER_PORT=8081
+      - OFFLINE_MODE=${OFFLINE_MODE:-true}
+    command: ["python", "live_backend.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  # ── Dashboard API (port 8080) ───────────────────────────────
+  dashboard-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: security-dashboard-api
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FORWARDER_API_URL=http://forwarder:8081
+      - DASHBOARD_API_PORT=8080
+      - REMEDIATION_DRY_RUN=${REMEDIATION_DRY_RUN:-false}
+      - REMEDIATION_AUTONOMY_MODE=${REMEDIATION_AUTONOMY_MODE:-autonomous}
+      - REMEDIATION_SIGKILL_THRESHOLD=${REMEDIATION_SIGKILL_THRESHOLD:-0.85}
+      - REMEDIATION_YAML_THRESHOLD=${REMEDIATION_YAML_THRESHOLD:-0.75}
+    command: ["python", "dashboard_api.py"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      forwarder:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  # ── Security-Core Orchestrator API (port 8000) ──────────────
+  security-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: security-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8100
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - security-net
+
+  # ── ChromaDB (Pinecone fallback for offline/demo mode) ──────
+  chromadb:
+    image: ghcr.io/chroma-core/chroma:0.5.23
+    container_name: security-chromadb
+    ports:
+      - "8100:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - security-net
+
+volumes:
+  redis-data:
+    driver: local
+  chroma-data:
+    driver: local
+
+networks:
+  security-net:
+    driver: bridge

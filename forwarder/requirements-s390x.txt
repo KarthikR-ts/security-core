@@ -1,0 +1,13 @@
+# Workload Security — Forwarder Constraints for linux/s390x
+# Core pipeline (Pure Python or prebuilt s390x wheels on PyPI)
+redis==5.0.3
+pydantic==2.6.4
+fastapi==0.110.0
+uvicorn==0.28.0
+requests==2.31.0
+pytest==8.1.1
+
+# Optional ML dependencies for x86 / platforms with prebuilt wheels
+# On linux/s390x, ml_triage falls back cleanly to the built-in heuristic rule engine
+# if numpy, scikit-learn, or xgboost are omitted.
+numpy>=1.26.0,<2.0.0
