@@ -18,13 +18,21 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useMemo, useState, useCallback } from 'react'
+import { useMemo, useState, useCallback, Fragment } from 'react'
 
 export default function CommandCenter() {
   const {
     immunityScore, immunityData, metrics, triageStats, cluster,
     enforcementMode, toggleEnforcement, events, policies, timeline,
+    health, enforcementThreshold, enforcementToggledAt,
   } = useStore()
+
+  // Derived from the live health block. No placeholder defaults: a fabricated
+  // architecture or liveness indicator is exactly the failure mode this
+  // project exists to avoid.
+  const platformHost = health?.platform?.source_host
+  const platformArch = health?.platform?.source_arch
+  const platformLive = Boolean(health?.platform?.live_capture)
 
   const lastEventAge = useMemo(() => {
     if (!metrics?.last_event_timestamp) return null
@@ -97,23 +105,43 @@ export default function CommandCenter() {
           Cluster map is dominant (8 col). Right panel stacks secondary data. */}
       <div className="flex-1 flex min-h-0">
 
-        {/* LEFT: Cluster Map */}
+        {/* LEFT: real execution topology */}
         <div className="flex-1 border-r border-border flex flex-col overflow-hidden bg-background">
           <div className="flex-none px-6 py-4 border-b border-border flex items-center justify-between bg-muted/5">
             <div className="flex items-center gap-3">
               <div className="p-1.5 bg-primary/10 rounded-md border border-primary/20">
                 <Server className="w-4 h-4 text-primary" />
               </div>
-              <span className="text-sm font-semibold text-foreground tracking-tight">Cluster Node Map</span>
-              <span className="text-xs text-muted-foreground ml-2 px-2 py-0.5 bg-muted rounded-full">— kind-control-plane · {cluster?.nodes?.length || 3} nodes · {cluster?.total_pods || 0} pods</span>
+              <span className="text-sm font-semibold text-foreground tracking-tight">Execution Topology</span>
+              <span className="text-xs text-muted-foreground ml-2 px-2 py-0.5 bg-muted rounded-full">
+                {cluster?.host?.hostname || platformHost || '—'}
+                {' · '}
+                {cluster?.host?.machine || platformArch || '—'}
+                {cluster?.has_orchestrator ? '' : ' · native install'}
+              </span>
             </div>
-            <div className="flex items-center gap-2 text-xs text-emerald-500 font-medium px-2 py-1 bg-emerald-500/10 rounded-md border border-emerald-500/20 shadow-[0_0_10px_rgba(16,185,129,0.1)]">
-              <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-              Live Monitor
+            <div
+              className={`flex items-center gap-2 text-xs font-medium px-2 py-1 rounded-md border ${
+                platformLive
+                  ? 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20'
+                  : 'text-muted-foreground bg-muted/30 border-border'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  platformLive ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground'
+                }`}
+              />
+              {platformLive ? 'Live Sensor' : 'No Live Sensor'}
             </div>
           </div>
           <div className="flex-1 overflow-hidden p-6 flex flex-col">
-            <LiveNodeGraph cluster={cluster} events={events} />
+            <HostPipeline
+              cluster={cluster}
+              health={health}
+              events={events}
+              policies={policies}
+            />
           </div>
         </div>
 
@@ -141,9 +169,22 @@ export default function CommandCenter() {
                 </div>
               </div>
               <div className="pt-2 space-y-2">
-                <OperationalRow label="Active Policies" value={`${policies?.length || 0} active`} />
-                <OperationalRow label="Alert Threshold" value="HIGH and above" />
-                <OperationalRow label="Last Toggle" value={new Date().toLocaleTimeString('en-US', { hour12: false })} />
+                <OperationalRow
+                  label="TracingPolicies"
+                  value={
+                    (policies || []).length === 0
+                      ? 'none on disk'
+                      : `${(policies || []).filter((p) => p.enforced).length}/${policies.length} enforced`
+                  }
+                />
+                <OperationalRow
+                  label="Alert Threshold"
+                  value={enforcementThreshold ?? 'not configured'}
+                />
+                <OperationalRow
+                  label="Last Toggle"
+                  value={enforcementToggledAt ? formatTime(enforcementToggledAt) : 'never toggled'}
+                />
               </div>
             </div>
           </div>
@@ -155,10 +196,10 @@ export default function CommandCenter() {
               Active Severity Breakdown
             </div>
             <div className="space-y-3">
-              <SeverityRow label="CRITICAL" count={metrics?.active_severity?.critical || 0} total={metrics?.events_total || 1} color="text-destructive font-bold" barColor="bg-destructive shadow-[0_0_8px_rgba(var(--destructive),0.5)]" />
-              <SeverityRow label="HIGH"     count={metrics?.active_severity?.high || 0}     total={metrics?.events_total || 1} color="text-orange-500 font-bold" barColor="bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]" />
-              <SeverityRow label="MEDIUM"   count={metrics?.active_severity?.medium || 0}   total={metrics?.events_total || 1} color="text-amber-500 font-medium" barColor="bg-amber-500" />
-              <SeverityRow label="LOW"      count={metrics?.active_severity?.low || 0}      total={metrics?.events_total || 1} color="text-muted-foreground" barColor="bg-muted-foreground" />
+              <SeverityRow label="CRITICAL" count={metrics?.active_severity?.critical || 0} total={metrics?.events_total || 0} color="text-destructive font-bold" barColor="bg-destructive shadow-[0_0_8px_rgba(var(--destructive),0.5)]" />
+              <SeverityRow label="HIGH"     count={metrics?.active_severity?.high || 0}     total={metrics?.events_total || 0} color="text-orange-500 font-bold" barColor="bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]" />
+              <SeverityRow label="MEDIUM"   count={metrics?.active_severity?.medium || 0}   total={metrics?.events_total || 0} color="text-amber-500 font-medium" barColor="bg-amber-500" />
+              <SeverityRow label="LOW"      count={metrics?.active_severity?.low || 0}      total={metrics?.events_total || 0} color="text-muted-foreground" barColor="bg-muted-foreground" />
             </div>
             {(metrics?.neutralized_count || 0) > 0 && (
               <div className="mt-3 pt-3 border-t border-border text-xs text-emerald-500 font-mono">
@@ -202,221 +243,132 @@ export default function CommandCenter() {
   )
 }
 
-/* ── Live Node Graph ────────────────────────────────────────────────
-   SVG-based cluster map. Nodes show structured operational data.
-   Color indicates health/activity, not decoration. */
-function LiveNodeGraph({ cluster, events }) {
-  const nodeActivity = useMemo(() => {
-    const activity = {}
-    for (const e of (events || []).slice(0, 50)) {
-      const node = e.node_name
-      if (node) {
-        if (!activity[node]) activity[node] = { total: 0, tp: 0 }
-        activity[node].total += 1
-        if (e.triage?.grade === 'TP') activity[node].tp += 1
-      }
-    }
-    return activity
-  }, [events])
+/* -- Host Pipeline Graph -------------------------------------------------
+   Renders the REAL execution topology: the actual host, the actual sensor,
+   and the actual stream. Nothing here is illustrative.
 
-  const getStats = useCallback((nMatch) => {
-    return Object.entries(nodeActivity).reduce((acc, [name, stats]) => {
-        const matches = nMatch === 'worker' ? name.endsWith('-worker') : name.includes(nMatch)
-        if (matches) {
-            acc.total += stats.total;
-            acc.tp += stats.tp;
-        }
-        return acc;
-    }, { total: 0, tp: 0 })
-  }, [nodeActivity])
+   This replaced a hardcoded SVG of a three-node Kind cluster with Tetragon
+   DaemonSets, which rendered identically on a LinuxONE VM that has neither
+   Kubernetes nor Tetragon. Fabricated topology is worse than none, because it
+   is indistinguishable from real data at a glance. */
+function HostPipeline({ cluster, health, events, policies }) {
+  const host = cluster?.host || {}
+  const platform = health?.platform || {}
+  const sensorKind = platform.sensor_kind || null
+  const isLive = Boolean(platform.live_capture)
 
-  const [selectedNodeId, setSelectedNodeId] = useState(null)
+  const tpCount = useMemo(
+    () => (events || []).filter((e) => e.triage?.grade === 'TP').length,
+    [events]
+  )
+  const totalEvents = (events || []).length
 
-  // Pre-define nodes with wider spacing
-  const mapNodes = [
-    { id: 'cluster', label: 'Kind Kubernetes Cluster', icon: Database, x: 340, y: 70, w: 240, h: 70, type: 'cluster' },
-    
-    { id: 'cp', label: 'control-plane', icon: Compass, x: 140, y: 220, w: 180, h: 65, type: 'node', match: 'control-plane' },
-    { id: 'w1', label: 'worker-1', icon: HardHat, x: 340, y: 220, w: 180, h: 65, type: 'node', match: 'worker' },
-    { id: 'w2', label: 'worker-2', icon: Cog, x: 540, y: 220, w: 180, h: 65, type: 'node', match: 'worker2' },
+  const enforcedPolicies = (policies || []).filter((p) => p.enforced).length
+  const presentPolicies = (policies || []).length
 
-    { id: 'tet-cp', label: 'Tetragon DaemonSet', icon: Hexagon, x: 140, y: 350, w: 180, h: 60, type: 'agent', match: 'control-plane' },
-    { id: 'tet-w1', label: 'Tetragon Pod', icon: Shield, x: 340, y: 350, w: 180, h: 60, type: 'agent', match: 'worker' },
-    { id: 'tet-w2', label: 'Tetragon Pod', icon: Shield, x: 540, y: 350, w: 180, h: 60, type: 'agent', match: 'worker2' },
+  const stages = [
+    {
+      id: 'host',
+      icon: Server,
+      label: 'Execution Host',
+      sub: host.hostname || platform.source_host || 'unknown',
+      rows: [
+        ['Architecture', host.machine || platform.source_arch || '�'],
+        ['Kernel', host.release || '�'],
+        ['vCPU', host.cpu_count ?? '�'],
+        ['Orchestrator', cluster?.orchestrator || 'none (native install)'],
+      ],
+      ok: Boolean(host.machine),
+    },
+    {
+      id: 'sensor',
+      icon: Activity,
+      label: 'Sensor',
+      sub: isLive ? 'live' : 'not running',
+      rows: [
+        ['Kind', sensorKind || '�'],
+        ['Is eBPF', platform.sensor_is_ebpf === true ? 'yes' : 'no'],
+        ['Capture mode', platform.capture_mode || '�'],
+      ],
+      ok: isLive,
+    },
+    {
+      id: 'policies',
+      icon: Shield,
+      label: 'TracingPolicies',
+      sub: presentPolicies === 0 ? 'none present' : `${enforcedPolicies}/${presentPolicies} enforced`,
+      rows: presentPolicies === 0
+        ? [['Status', 'no policy files on disk']]
+        : [
+            ['On disk', String(presentPolicies)],
+            ['Enforced', String(enforcedPolicies)],
+            ['Note', enforcedPolicies === 0 ? 'sensor not running' : 'loaded'],
+          ],
+      ok: enforcedPolicies > 0,
+    },
+    {
+      id: 'stream',
+      icon: Database,
+      label: 'Event Stream',
+      sub: health?.components?.redis?.stream || '�',
+      rows: [
+        ['Redis', health?.components?.redis?.status || '�'],
+        ['Events cached', String(health?.events_cached ?? 0)],
+        ['True positives', String(tpCount)],
+      ],
+      ok: health?.components?.redis?.status === 'connected',
+    },
   ]
 
-  // Render a sleek map node
-  const renderNode = (n) => {
-    const stats = n.match ? getStats(n.match) : { total: 0, tp: 0 }
-    const active = stats.total > 0
-    const hasCritical = stats.tp > 0
-    
-    const bx = n.x - n.w / 2
-    const by = n.y - n.h / 2
-    const Icon = n.icon
-    const isSelected = selectedNodeId === n.id
-    
-    const borderColor = isSelected 
-        ? 'rgba(56,189,248,1)' 
-        : hasCritical 
-            ? 'rgba(239,68,68,0.8)' 
-            : active 
-                ? 'rgba(34,211,238,0.4)' 
-                : 'rgba(255,255,255,0.15)'
-                
-    const bgColor = n.type === 'cluster' 
-        ? 'rgba(30,41,59,0.9)' 
-        : hasCritical
-            ? 'rgba(69,10,10,0.85)' // deep red
-            : isSelected 
-                ? 'rgba(30,41,59,0.95)' 
-                : 'rgba(17,24,39,0.85)'
-    
-    return (
-      <g key={n.id} className="cursor-pointer transition-transform hover:-translate-y-0.5" onClick={() => setSelectedNodeId(n.id === selectedNodeId ? null : n.id)}>
-        {active && !isSelected && (
-          <rect x={bx - 2} y={by - 2} width={n.w + 4} height={n.h + 4} rx="10" fill="none" 
-            stroke={hasCritical ? "rgba(239,68,68,0.4)" : "rgba(34,211,238,0.15)"} strokeWidth="3">
-            <animate attributeName="opacity" values="0.8;0.3;0.8" dur="2s" repeatCount="indefinite" />
-          </rect>
-        )}
-        {(isSelected) && (
-          <rect x={bx - 3} y={by - 3} width={n.w + 6} height={n.h + 6} rx="11" fill="none" stroke="rgba(56,189,248,0.4)" strokeWidth="3" />
-        )}
-        <rect x={bx} y={by} width={n.w} height={n.h} rx="8" fill={bgColor} stroke={borderColor} strokeWidth={isSelected ? "2" : "1.5"} className="drop-shadow-sm transition-colors" />
-        <rect x={bx} y={by} width={n.w} height={32} rx="8" fill="rgba(255,255,255,0.04)" />
-        <rect x={bx} y={by + 24} width={n.w} height={8} fill="rgba(255,255,255,0.04)" />
-        
-        {Icon && <Icon className={`w-4 h-4 ${hasCritical ? 'text-red-400' : 'text-emerald-500/90'}`} x={bx + 12} y={by + 9} />}
-        
-        <text x={bx + 34} y={by + 20} fill={isSelected ? "#bae6fd" : "#f8fafc"} fontSize={n.type === 'cluster' ? '12.5' : '11.5'} fontWeight="600" fontFamily="'JetBrains Mono', monospace">
-          {n.label}
-        </text>
-
-        {hasCritical ? (
-          <text x={n.x} y={by + 48} fill="#ef4444" fontSize="11" fontWeight="bold" textAnchor="middle" fontFamily="Inter, sans-serif">
-            {stats.tp} critical alerts
-          </text>
-        ) : active ? (
-          <text x={n.x} y={by + 48} fill="#38bdf8" fontSize="11" fontWeight="bold" textAnchor="middle" fontFamily="Inter, sans-serif">
-            {stats.total} recent events
-          </text>
-        ) : (
-           <text x={n.x} y={by + 48} fill="#64748b" fontSize="10" fontWeight="500" textAnchor="middle" fontFamily="Inter, sans-serif">
-             Monitoring active
-           </text>
-        )}
-      </g>
-    )
-  }
-
-  // Draw hierarchical connecting lines
-  const renderLines = () => {
-    return (
-      <g stroke="rgba(255,255,255,0.12)" strokeWidth="1.5" strokeDasharray="4 4" fill="none">
-        {/* Cluster to Nodes */}
-        <path d="M 340 105 L 340 145 L 140 145 L 140 187" />
-        <path d="M 340 105 L 340 187" />
-        <path d="M 340 105 L 340 145 L 540 145 L 540 187" />
-        
-        {/* Nodes to Tetragon */}
-        <line x1="140" y1="252" x2="140" y2="320" />
-        <line x1="340" y1="252" x2="340" y2="320" />
-        <line x1="540" y1="252" x2="540" y2="320" />
-
-        {/* Tetragon to Action Plane */}
-        <path d="M 140 380 L 140 420 L 340 420 L 340 435" />
-        <path d="M 340 380 L 340 435" />
-        <path d="M 540 380 L 540 420 L 340 420 L 340 435" />
-      </g>
-    )
-  }
-
-  // Selected Node Details logic
-  const selectedNode = mapNodes.find(n => n.id === selectedNodeId)
-  const isAgent = selectedNode?.type === 'agent'
-  const isCluster = selectedNode?.type === 'cluster'
-
   return (
-    <div className="w-full h-full flex relative">
-      <div className={`flex-1 flex flex-col justify-center items-center transition-all ${selectedNodeId ? 'w-2/3 pr-64' : 'w-full'}`}>
-        <svg className="w-full h-full max-h-[580px]" viewBox="20 20 640 500" preserveAspectRatio="xMidYMid meet">
-          {renderLines()}
-          {mapNodes.map(renderNode)}
-
-          {/* Action Plane (Bottom) */}
-          <g transform="translate(230, 435)">
-            <rect width="220" height="50" rx="8" fill="rgba(15,23,42,0.95)" stroke="rgba(255,255,255,0.2)" strokeWidth="1.5" className="drop-shadow-lg" />
-            <Zap className="w-5 h-5 text-emerald-400" x="50" y="15" />
-            <text x="76" y="31" fill="#f8fafc" fontSize="13" fontWeight="bold" fontFamily="Inter, sans-serif">Action Plane</text>
-          </g>
-        </svg>
-      </div>
-
-      {/* Slide-out details panel */}
-      {selectedNodeId && (
-        <motion.div 
-          initial={{ opacity: 0, x: 20 }}
-          animate={{ opacity: 1, x: 0 }}
-          className="absolute right-0 top-0 bottom-0 w-64 bg-background border-l border-border p-5 flex flex-col shadow-xl z-10 overflow-y-auto"
-        >
-          <div className="flex items-center gap-3 mb-6">
-            <div className="p-2 bg-primary/10 rounded-md border border-primary/20">
-              {selectedNode?.icon && <selectedNode.icon className="w-5 h-5 text-primary" />}
+    <div className="flex-1 flex flex-col gap-3 overflow-y-auto">
+      {stages.map((s, i) => {
+        const Icon = s.icon
+        return (
+          <Fragment key={s.id}>
+            <div
+              className={`rounded-lg border px-4 py-3 transition-colors ${
+                s.ok ? 'border-border bg-card/40' : 'border-border/60 bg-card/20'
+              }`}
+            >
+              <div className="flex items-center gap-2.5 mb-2">
+                <Icon
+                  size={15}
+                  className={s.ok ? 'text-primary' : 'text-muted-foreground'}
+                />
+                <span className="text-xs font-semibold text-foreground tracking-tight">
+                  {s.label}
+                </span>
+                <span
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ml-auto ${
+                    s.ok
+                      ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
+                      : 'text-muted-foreground border-border bg-muted/30'
+                  }`}
+                >
+                  {s.sub}
+                </span>
+              </div>
+              <div className="space-y-1 pl-[23px]">
+                {s.rows.map(([k, v]) => (
+                  <div key={k} className="flex items-baseline gap-2 text-[11px] font-mono">
+                    <span className="text-muted-foreground w-24 shrink-0">{k}</span>
+                    <span className="text-foreground/90 truncate">{String(v)}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div>
-              <div className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{selectedNode?.type}</div>
-              <div className="text-sm font-semibold text-foreground truncate">{selectedNode?.label}</div>
-            </div>
-          </div>
-          
-          <div className="space-y-6">
-            <div className="space-y-3">
-              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest border-b border-border pb-1">Status</div>
-              <OperationalRow label="Health" value="Healthy" valueClass="text-emerald-500" />
-              <OperationalRow label="Connection" value="Active WebSocket" valueClass="text-emerald-500" />
-              <OperationalRow label="Uptime" value="14d 2h 4m" />
-            </div>
-
-            {!isCluster && (
-              <div className="space-y-3">
-                <div className="text-xs font-semibold text-muted-foreground uppercase tracking-widest border-b border-border pb-1">Telemetry</div>
-                {isAgent ? (
-                  <>
-                    <OperationalRow label="eBPF Programs" value="Loaded (Traced)" />
-                    <OperationalRow label="Events Sent" value={getCount(selectedNode.match) || '0'} />
-                    <OperationalRow label="Memory Usage" value="42 MB" />
-                  </>
-                ) : (
-                  <>
-                    <OperationalRow label="Node IP" value={`10.0.${selectedNode.match.replace('-', '.')}`} />
-                    <OperationalRow label="Active Pods" value={selectedNode.id === 'cp' ? '12' : '4'} />
-                    <OperationalRow label="OS Image" value="Ubuntu 22.04 LTS" />
-                  </>
-                )}
+            {i < stages.length - 1 && (
+              <div className="flex justify-center -my-1 text-border">
+                <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                  <path d="M5 0 L9 6 L1 6 Z" fill="currentColor" opacity="0.5" />
+                </svg>
               </div>
             )}
-            
-            <button 
-              onClick={() => setSelectedNodeId(null)}
-              className="w-full mt-4 py-2 bg-muted hover:bg-muted/80 text-foreground text-xs font-medium rounded-md transition-colors"
-            >
-              Close Details
-            </button>
-          </div>
-        </motion.div>
-      )}
+          </Fragment>
+        )
+      })}
     </div>
-  )
-}
-
-/* Small SVG helper: label/value row inside a node card */
-function NodeDataRow({ x, y, label, value, valueColor = '#94a3b8' }) {
-  return (
-    <>
-      <text x={x} y={y} fill="#475569" fontSize="9.5" fontFamily="Inter, sans-serif">{label}</text>
-      <text x={x + 100} y={y} fill={valueColor} fontSize="9.5" fontFamily="'JetBrains Mono', monospace" fontWeight="600">{value}</text>
-    </>
   )
 }
 

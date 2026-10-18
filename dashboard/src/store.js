@@ -8,32 +8,55 @@ export const useStore = create((set, get) => ({
   navigate: (page) => set({ currentPage: page }),
 
   // ── Enforcement Mode ──
+  // enforcementThreshold and enforcementToggledAt are null until the API
+  // reports them. Previously the UI invented a threshold and rendered the
+  // current wall-clock time as "Last Toggle", which reads as a real record of
+  // an action that never happened.
   enforcementMode: 'shadow',
+  enforcementThreshold: null,
+  enforcementToggledAt: null,
   toggleEnforcement: async () => {
+    const previous = get().enforcementMode
+    const next = previous === 'guardian' ? 'shadow' : 'guardian'
+    set({ enforcementMode: next, enforcementToggledAt: Date.now() })
     try {
-      const res = await fetch(`${API_BASE}/api/enforcement/mode`, { method: 'POST' })
+      const res = await fetch(`${API_BASE}/api/enforcement/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: next }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      set({ enforcementMode: data.mode })
-      // Refresh immunity score after toggling
+      set({
+        enforcementMode: data.mode,
+        enforcementThreshold: data.threshold ?? null,
+        enforcementToggledAt: Date.now(),
+      })
       get().fetchImmunityScore()
     } catch (err) {
+      // Roll back rather than leave the UI claiming a state the API rejected.
+      set({ enforcementMode: previous, enforcementToggledAt: null })
       console.error('Failed to toggle enforcement:', err)
     }
   },
 
   // ── Immunity Score ──
-  immunityScore: 85,
+  // null, not 85. A hardcoded score renders as a real measurement and stays
+  // on screen indefinitely if the fetch fails.
+  immunityScore: null,
   immunityData: null,
   fetchImmunityScore: async () => {
     try {
       const res = await fetch(`${API_BASE}/api/immunity-score`)
       const data = await res.json()
       set({
-        immunityScore: data.score,
+        immunityScore: data.score ?? null,
         immunityData: data,
-        enforcementMode: data.enforcement_mode,
+        enforcementMode: data.enforcement_mode ?? get().enforcementMode,
+        enforcementThreshold: data.threshold ?? null,
       })
     } catch (err) {
+      set({ immunityScore: null })
       console.error('Failed to fetch immunity score:', err)
     }
   },

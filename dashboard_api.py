@@ -19,6 +19,7 @@ import json
 import time
 import asyncio
 import platform
+import shutil
 import logging
 import datetime
 import subprocess
@@ -444,22 +445,40 @@ def _compute_immunity_score(events: list[dict]) -> dict:
 
 
 def _load_policies() -> list[dict]:
-    """Load TracingPolicy YAML files from the policies directory."""
-    policies = []
+    """
+    List the TracingPolicy YAML files present on disk.
+
+    A file existing is not a policy being enforced. These are Tetragon
+    TracingPolicies, and Tetragon is not running on this host, so every entry
+    is reported as NOT loaded rather than "active". Claiming otherwise was the
+    other half of the fabricated-topology problem: the UI showed a row of green
+    policy dots for instrumentation that does not exist.
+    """
+    policies: list[dict] = []
     policy_dir = Path(POLICIES_DIR)
 
+    sensor_running = _tetragon_is_running()
+
     if not policy_dir.exists():
-        return []
+        return policies
 
     for yaml_file in sorted(policy_dir.glob("*.yaml")):
         try:
             with open(yaml_file, "r") as f:
                 doc = yaml.safe_load(f)
+            meta = (doc or {}).get("metadata", {}) or {}
+            spec = (doc or {}).get("spec", {}) or {}
             policies.append({
-                "name": doc.get("metadata", {}).get("name", yaml_file.stem),
+                "name": meta.get("name", yaml_file.stem),
                 "file": yaml_file.name,
-                "kind": doc.get("kind", "TracingPolicy"),
-                "status": "active",
+                "kind": doc.get("kind", "TracingPolicy") if doc else "TracingPolicy",
+                # Truthful state: present on disk, but only enforced if the
+                # sensor that consumes it is actually running.
+                "present": True,
+                "enforced": sensor_running,
+                "status": "loaded" if sensor_running else "not_loaded",
+                "description": spec.get("description", "") or "",
+                "targets": _policy_targets(doc),
             })
         except Exception as e:
             logger.warning("Failed to load policy %s: %s", yaml_file, e)
@@ -469,11 +488,17 @@ def _load_policies() -> list[dict]:
         try:
             with open(root_policy, "r") as f:
                 doc = yaml.safe_load(f)
+            meta = (doc or {}).get("metadata", {}) or {}
+            spec = (doc or {}).get("spec", {}) or {}
             policies.append({
-                "name": doc.get("metadata", {}).get("name", "security-full"),
+                "name": meta.get("name", "security-full"),
                 "file": root_policy.name,
-                "kind": doc.get("kind", "TracingPolicy"),
-                "status": "active",
+                "kind": doc.get("kind", "TracingPolicy") if doc else "TracingPolicy",
+                "present": True,
+                "enforced": sensor_running,
+                "status": "loaded" if sensor_running else "not_loaded",
+                "description": spec.get("description", "") or "",
+                "targets": _policy_targets(doc),
             })
         except Exception:
             pass
@@ -481,39 +506,111 @@ def _load_policies() -> list[dict]:
     return policies
 
 
+def _tetragon_is_running() -> bool:
+    """True only if a Tetragon process is actually alive on this host."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return False
+    try:
+        for pid_dir in proc_root.iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            try:
+                comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+            except (OSError, PermissionError):
+                continue
+            if comm in ("tetragon", "tetra"):
+                return True
+    except (OSError, PermissionError):
+        pass
+    return False
+
+
+def _policy_targets(doc) -> list[str]:
+    """
+    Extract the syscall/function names a TracingPolicy attaches to.
+
+    Handles both shapes used in policies/: spec.trace.selectors (kprobe style)
+    and spec.kprobes (a list of probe blocks). Returns an empty list rather
+    than guessing when the structure is not recognised.
+    """
+    targets: list[str] = []
+    if not isinstance(doc, dict):
+        return targets
+    spec = doc.get("spec") or {}
+    if not isinstance(spec, dict):
+        return targets
+
+    # spec.kprobes: list of {call: "__x64_sys_execve", selectors: [...]}
+    for probe in spec.get("kprobes", []) or []:
+        if isinstance(probe, dict) and probe.get("call"):
+            targets.append(str(probe["call"]))
+
+    # spec.trace: {selectors: [{callArgs: [{syscall|function: ...}]}]}
+    tracer = spec.get("trace") or {}
+    if isinstance(tracer, dict):
+        for selector in tracer.get("selectors", []) or []:
+            if not isinstance(selector, dict):
+                continue
+            for call in selector.get("callArgs", []) or []:
+                if isinstance(call, dict):
+                    for key in ("syscall", "function"):
+                        if call.get(key):
+                            targets.append(str(call[key]))
+
+    # De-duplicate, preserve order.
+    seen: set[str] = set()
+    return [t for t in targets if not (t in seen or seen.add(t))]
+
+
+def _detect_orchestrator() -> str | None:
+    """
+    Report the orchestrator actually present on THIS host.
+
+    Returns None rather than a plausible-looking default. The previous
+    implementation returned a hardcoded three-node Kind cluster, which made
+    the UI claim a running Kubernetes cluster with Tetragon installed on a
+    host that has neither. Fabricated topology is worse than an empty one:
+    it is indistinguishable from real data at a glance.
+    """
+    for binary, label in (("kubectl", "kubernetes"), ("oc", "openshift")):
+        if shutil.which(binary):
+            return label
+    return None
+
+
 def _build_cluster_info() -> dict:
-    """Build cluster info from environment or defaults matching Kind config."""
+    """
+    Describe the real execution environment.
+
+    Reports the host as it actually is. When there is no orchestrator, says
+    so explicitly instead of inventing one.
+    """
+    orchestrator = _detect_orchestrator()
+    machine = platform.machine()
+
     return {
-        "cluster_name": os.getenv("CLUSTER_NAME", "security-cluster"),
-        "provider": "kind",
-        "nodes": [
-            {
-                "name": "security-cluster-control-plane",
-                "role": "control-plane",
-                "status": "Ready",
-                "os": "Ubuntu 22.04",
-                "kernel": "6.x",
-                "tetragon": True,
-            },
-            {
-                "name": "security-cluster-worker",
-                "role": "worker",
-                "status": "Ready",
-                "os": "Ubuntu 22.04",
-                "kernel": "6.x",
-                "tetragon": True,
-            },
-            {
-                "name": "security-cluster-worker2",
-                "role": "worker",
-                "status": "Ready",
-                "os": "Ubuntu 22.04",
-                "kernel": "6.x",
-                "tetragon": True,
-            },
-        ],
-        "total_nodes": 3,
-        "total_pods": len([e for e in _event_cache if e.get("telemetry", {}).get("pod")]),
+        # None, not a default name. A fabricated cluster_name reads as a real
+        # cluster to anything consuming this endpoint.
+        "cluster_name": None,
+        "orchestrator": orchestrator,
+        "has_orchestrator": orchestrator is not None,
+        "nodes": [],
+        "total_nodes": 0,
+        "total_pods": 0,
+        "degraded_reason": (
+            None if orchestrator
+            else "No Kubernetes or OpenShift context on this host — this deployment runs natively."
+        ),
+        "host": {
+            "hostname": platform.node(),
+            "machine": machine,
+            "system": platform.system(),
+            "release": platform.release(),
+            "python": platform.python_version(),
+            "cpu_count": os.cpu_count(),
+            "is_s390x": machine.lower() == "s390x",
+        },
     }
 
 
